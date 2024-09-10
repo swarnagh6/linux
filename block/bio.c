@@ -1167,9 +1167,21 @@ void __bio_release_pages(struct bio *bio, bool mark_dirty)
 			folio_mark_dirty(fi.folio);
 			folio_unlock(fi.folio);
 		}
+<<<<<<< HEAD
 		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
 			   fi.offset / PAGE_SIZE + 1;
 		unpin_user_folio(fi.folio, nr_pages);
+=======
+		page = folio_page(fi.folio, fi.offset / PAGE_SIZE);
+		bio_release_page(bio, page);
+#if 0
+		nr_pages = (fi.offset + fi.length - 1) / PAGE_SIZE -
+			   fi.offset / PAGE_SIZE + 1;
+		do {
+			bio_release_page(bio, page++);
+		} while (--nr_pages != 0);
+#endif
+>>>>>>> 7d18d8266bf5 (block/mm: conversion of GUP to folio based mapping)
 	}
 }
 EXPORT_SYMBOL_GPL(__bio_release_pages);
@@ -1193,7 +1205,22 @@ void bio_iov_bvec_set(struct bio *bio, const struct iov_iter *iter)
 static int bio_iov_iter_align_down(struct bio *bio, struct iov_iter *iter,
 			    unsigned len_align_mask)
 {
+<<<<<<< HEAD
 	size_t nbytes = bio->bi_iter.bi_size & len_align_mask;
+=======
+	iov_iter_extraction_t extraction_flags = 0;
+	unsigned short nr_pages = bio->bi_max_vecs - bio->bi_vcnt;
+	unsigned short entries_left = bio->bi_max_vecs - bio->bi_vcnt;
+	struct bio_vec *bv = bio->bi_io_vec + bio->bi_vcnt;
+	struct page **pages = (struct page **)bv;
+	//struct folio_vec **folios = (struct folio_vec **)bv;
+	struct folio_vec local[32];
+	struct folio_vec **folios = (struct folio_vec **)&local;
+	ssize_t size, left;
+	unsigned len, i = 0;
+	size_t offset;
+	int ret = 0;
+>>>>>>> 7d18d8266bf5 (block/mm: conversion of GUP to folio based mapping)
 
 	if (!nbytes)
 		return 0;
@@ -1203,10 +1230,28 @@ static int bio_iov_iter_align_down(struct bio *bio, struct iov_iter *iter,
 	do {
 		struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
 
+<<<<<<< HEAD
 		if (nbytes < bv->bv_len) {
 			bv->bv_len -= nbytes;
 			break;
 		}
+=======
+	/*
+	 * Each segment in the iov is required to be a block size multiple.
+	 * However, we may not be able to get the entire segment if it spans
+	 * more pages than bi_max_vecs allows, so we have to ALIGN_DOWN the
+	 * result to ensure the bio's total size is correct. The remainder of
+	 * the iov data will be picked up in the next bio iteration.
+	 */
+
+	int nr_folio_vecs = 0;
+	size = iov_iter_extract_folios(iter, &folios,
+				       UINT_MAX - bio->bi_iter.bi_size,
+				       nr_pages, extraction_flags, &offset,
+				       &nr_folio_vecs);
+	if (unlikely(size <= 0))
+		return size ? size : -EFAULT;
+>>>>>>> 7d18d8266bf5 (block/mm: conversion of GUP to folio based mapping)
 
 		if (bio_flagged(bio, BIO_PAGE_PINNED))
 			unpin_user_page(bv->bv_page);
@@ -1215,9 +1260,29 @@ static int bio_iov_iter_align_down(struct bio *bio, struct iov_iter *iter,
 		nbytes -= bv->bv_len;
 	} while (nbytes);
 
+<<<<<<< HEAD
 	if (!bio->bi_vcnt)
 		return -EFAULT;
 	return 0;
+=======
+	if (unlikely(!size)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	for (i = 0; i< nr_folio_vecs; i++) {
+		struct folio_vec * vec = (void *)folios + (sizeof(struct folio_vec) * i);
+		offset = vec->fv_offset + offset;
+		len = vec->fv_len;
+		bio_add_folio_nofail(bio, vec->fv_folio, len, offset);
+		// TODO : use the folio function to add to the bio
+		offset = 0;
+	}
+	if (folios != &local)
+		kvfree(folios);
+out:
+	return ret;
+>>>>>>> 7d18d8266bf5 (block/mm: conversion of GUP to folio based mapping)
 }
 
 /**
