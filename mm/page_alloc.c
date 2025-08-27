@@ -55,10 +55,17 @@
 #include <linux/cacheinfo.h>
 #include <linux/pgalloc_tag.h>
 #include <asm/div64.h>
+#include <linux/vmstat.h>
+#include <linux/debugfs.h>
+#include <linux/cpumask.h>
 #include "internal.h"
 #include "shuffle.h"
 #include "page_reporting.h"
 
+#if defined CONFIG_COMPACTION
+#define CREATE_TRACE_POINTS
+#include <trace/events/page_alloc.h>
+#endif
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -4179,10 +4186,20 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 
 	if (page) {
 		struct zone *zone = page_zone(page);
-
 		zone->compact_blockskip_flush = false;
 		compaction_defer_reset(zone, order, true);
+
+		struct contig_page_info info;
+		int res_index;
+
+		fill_contig_page_info(zone, order, &info);
+		res_index = __fragmentation_index(order, &info);
+
 		count_vm_event(COMPACTSUCCESS);
+		trace_mm_compaction_success(zone, order, res_index); /* success trace point captured */
+		if (res_index > 0 && res_index <= 1000) {
+			count_vm_event(COMPACTSUCCESS_EXTFRAG);
+		}
 		return page;
 	}
 
@@ -4191,6 +4208,7 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	 * is that pages exist, but not enough to satisfy watermarks.
 	 */
 	count_vm_event(COMPACTFAIL);
+        trace_mm_compaction_failure(order); /*failure trace point captured */
 
 	cond_resched();
 

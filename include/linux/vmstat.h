@@ -269,6 +269,17 @@ static inline void fold_vm_numa_events(void)
 }
 #endif /* CONFIG_NUMA */
 
+#ifdef CONFIG_COMPACTION
+struct contig_page_info {
+	unsigned long free_pages;
+	unsigned long free_blocks_total;
+	unsigned long free_blocks_suitable;
+};
+void fill_contig_page_info(struct zone *zone, unsigned int suitable_order,struct contig_page_info *info);
+int __fragmentation_index(unsigned int order, struct contig_page_info *info);
+
+#endif /*CONFIG_COMPACTION*/
+
 #ifdef CONFIG_SMP
 void __mod_zone_page_state(struct zone *, enum zone_stat_item item, long);
 void __inc_zone_page_state(struct page *, enum zone_stat_item);

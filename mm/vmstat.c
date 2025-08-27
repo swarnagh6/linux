@@ -1046,12 +1046,6 @@ void memmap_pages_add(long delta)
 
 #ifdef CONFIG_COMPACTION
 
-struct contig_page_info {
-	unsigned long free_pages;
-	unsigned long free_blocks_total;
-	unsigned long free_blocks_suitable;
-};
-
 /*
  * Calculate the number of free pages in a zone, how many contiguous
  * pages are free and how many are large enough to satisfy an allocation of
@@ -1060,7 +1054,7 @@ struct contig_page_info {
  * migrated. Calculating that is possible, but expensive and can be
  * figured out from userspace
  */
-static void fill_contig_page_info(struct zone *zone,
+void fill_contig_page_info(struct zone *zone,
 				unsigned int suitable_order,
 				struct contig_page_info *info)
 {
@@ -1099,7 +1093,7 @@ static void fill_contig_page_info(struct zone *zone,
  * The value can be used to determine if page reclaim or compaction
  * should be used
  */
-static int __fragmentation_index(unsigned int order, struct contig_page_info *info)
+int __fragmentation_index(unsigned int order, struct contig_page_info *info)
 {
 	unsigned long requested = 1UL << order;
 
@@ -1375,6 +1369,7 @@ const char * const vmstat_text[] = {
 	[I(COMPACTSTALL)]			= "compact_stall",
 	[I(COMPACTFAIL)]			= "compact_fail",
 	[I(COMPACTSUCCESS)]			= "compact_success",
+	[I(COMPACTSUCCESS_EXTFRAG)]		= "compact_success_extfrag",
 	[I(KCOMPACTD_WAKE)]			= "compact_daemon_wake",
 	[I(KCOMPACTD_MIGRATE_SCANNED)]		= "compact_daemon_migrate_scanned",
 	[I(KCOMPACTD_FREE_SCANNED)]		= "compact_daemon_free_scanned",
