@@ -894,13 +894,18 @@ static void sd_config_discard(struct scsi_disk *sdkp, struct queue_limits *lim,
 
 static void *sd_set_special_bvec(struct request *rq, unsigned int data_len)
 {
-	struct page *page;
+	struct folio *folio;
+	int n, i;
 
-	page = mempool_alloc(sd_page_pool, GFP_ATOMIC);
-	if (!page)
+	folio = mempool_alloc(sd_page_pool, GFP_ATOMIC);
+	if (!folio)
 		return NULL;
-	clear_highpage(page);
-	bvec_set_page(&rq->special_vec, page, data_len, 0);
+
+	n = folio_nr_pages(folio);
+	for (i = 0; i < n; i++)
+		clear_highpage(folio_page(folio, i));
+
+	bvec_set_folio(&rq->special_vec, folio, data_len, 0);
 	rq->rq_flags |= RQF_SPECIAL_PAYLOAD;
 	return bvec_virt(&rq->special_vec);
 }
@@ -1479,7 +1484,7 @@ static void sd_uninit_command(struct scsi_cmnd *SCpnt)
 	struct request *rq = scsi_cmd_to_rq(SCpnt);
 
 	if (rq->rq_flags & RQF_SPECIAL_PAYLOAD)
-		mempool_free(rq->special_vec.bv_page, sd_page_pool);
+		mempool_free((struct folio *)rq->special_vec.bv_page, sd_page_pool);
 }
 
 static bool sd_need_revalidate(struct gendisk *disk, struct scsi_disk *sdkp)
@@ -2880,10 +2885,8 @@ got_data:
 			  "assuming 512.\n");
 	}
 
-	if (sector_size != 512 &&
-	    sector_size != 1024 &&
-	    sector_size != 2048 &&
-	    sector_size != 4096) {
+	if (sector_size < 512 || sector_size > BLK_MAX_BLOCK_SIZE ||
+	    !is_power_of_2(sector_size))  {
 		sd_printk(KERN_NOTICE, sdkp, "Unsupported sector size %d.\n",
 			  sector_size);
 		/*
@@ -4368,7 +4371,7 @@ static int __init init_sd(void)
 	if (err)
 		goto err_out;
 
-	sd_page_pool = mempool_create_page_pool(SD_MEMPOOL_SIZE, 0);
+	sd_page_pool = mempool_create_page_pool(SD_MEMPOOL_SIZE, 2);
 	if (!sd_page_pool) {
 		printk(KERN_ERR "sd: can't init discard page pool\n");
 		err = -ENOMEM;
