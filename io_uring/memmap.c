@@ -9,11 +9,54 @@
 #include <linux/io_uring.h>
 #include <linux/io_uring_types.h>
 #include <asm/shmparam.h>
+#include <linux/mm_inline.h>
 
 #include "memmap.h"
 #include "kbuf.h"
 #include "rsrc.h"
 #include "zcrx.h"
+
+
+struct io_uring_batch {
+	struct page		**pages;	/* for pin_user_pages_remote */
+	struct page		*fallback_page; /* if pages alloc fails  needed ?*/
+	unsigned int		capacity;	/* length of pages array */
+	unsigned int		size;		/* of batch currently */
+	unsigned int		offset;		/* of next entry in pages */
+	bool                    overriden_size;  /* has size been overriden */
+};
+
+#define IO_URING_BATCH_MAX_CAPACITY (PAGE_SIZE / sizeof(struct page *))
+
+static void io_uring_batch_init(struct io_uring_batch *batch)
+{
+	batch->size = 0;
+	batch->offset = 0;
+
+	batch->pages = (struct page **) __get_free_page(GFP_KERNEL);
+	if (!batch->pages)
+		goto fallback;
+
+	batch->capacity = IO_URING_BATCH_MAX_CAPACITY;
+	return;
+
+fallback:
+	batch->pages = &batch->fallback_page;
+	batch->capacity = 1;
+}
+
+static void io_uring_batch_cleanup(struct io_uring_batch *batch)
+{
+	if(!batch)
+		return;
+	if(batch->capacity > 1 && batch->pages)
+		free_page((unsigned long) batch->pages);
+
+	batch->pages = NULL;
+	batch->capacity = 0;
+	batch->size = 0;
+	batch->offset = 0;
+}
 
 static bool io_mem_alloc_compound(struct page **pages, int nr_pages,
 				  size_t size, gfp_t gfp)
@@ -39,9 +82,10 @@ static bool io_mem_alloc_compound(struct page **pages, int nr_pages,
 
 struct page **io_pin_pages(unsigned long uaddr, unsigned long len, int *npages)
 {
-	unsigned long start, end, nr_pages;
+	unsigned long start, end, nr_pages, nr_pages_contig;
 	struct page **pages;
 	int ret;
+	struct io_uring_batch batch;
 
 	if (check_add_overflow(uaddr, len, &end))
 		return ERR_PTR(-EOVERFLOW);
@@ -60,14 +104,31 @@ struct page **io_pin_pages(unsigned long uaddr, unsigned long len, int *npages)
 	if (!pages)
 		return ERR_PTR(-ENOMEM);
 
+	/* initialize the batch here */
+        io_uring_batch_init(&batch);
+
+	batch.pages = pages;
+	batch.size = nr_pages;
+
 	ret = pin_user_pages_fast(uaddr, nr_pages, FOLL_WRITE | FOLL_LONGTERM,
-					pages);
-	/* success, mapped all pages */
+				  batch.pages);
+
 	if (ret == nr_pages) {
-		*npages = nr_pages;
+		unsigned long nr_pages_contig = compound_nr(batch.pages[0]);
+		bool override_size = false;
+
+		if (nr_pages_contig > nr_pages) {
+			override_size = true;
+			ret = nr_pages_contig;
+			page_ref_add(batch.pages[0], nr_pages_contig - nr_pages);
+		}
+		batch.overriden_size = override_size;
+		batch.size = ret;
+		printk(KERN_INFO "io_uring_batch size with override %s %u\n",
+		       batch.overriden_size ? "enabled" : "disabled", batch.size);
+		*npages = ret;
 		return pages;
 	}
-
 	/* partial map, or didn't map anything */
 	if (ret >= 0) {
 		/* if we did partial map, release any pages we did get */
@@ -75,6 +136,8 @@ struct page **io_pin_pages(unsigned long uaddr, unsigned long len, int *npages)
 			unpin_user_pages(pages, ret);
 		ret = -EFAULT;
 	}
+
+	io_uring_batch_cleanup(&batch);
 	kvfree(pages);
 	return ERR_PTR(ret);
 }
