@@ -8,6 +8,7 @@
 #include <linux/nospec.h>
 #include <linux/hugetlb.h>
 #include <linux/compat.h>
+#include <linux/ktime.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/cmd.h>
 
@@ -103,7 +104,6 @@ static void io_release_ubuf(void *priv)
 
 	for (i = 0; i < imu->nr_bvecs; i++) {
 		struct folio *folio = page_folio(imu->bvec[i].bv_page);
-
 		unpin_user_folio(folio, 1);
 	}
 }
@@ -771,6 +771,9 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	int ret, nr_pages, i;
 	struct io_imu_folio_data data;
 	bool coalesced = false;
+	ktime_t start_time, end_time;
+	s64 elapsed_ns;
+	u64 elapsed_us;
 
 	if (!iov->iov_base) {
 		if (iov->iov_len)
@@ -789,13 +792,23 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		return ERR_PTR(-ENOMEM);
 
 	ret = -ENOMEM;
+
+	/* Start timing io_pin_pages */
+	start_time = ktime_get();
 	pages = io_pin_pages((unsigned long) iov->iov_base, iov->iov_len,
 				&nr_pages);
+	/* End timing io_pin_pages */
+	end_time = ktime_get();
+	elapsed_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+	elapsed_us = elapsed_ns / 1000;
+	
 	if (IS_ERR(pages)) {
 		ret = PTR_ERR(pages);
 		pages = NULL;
 		goto done;
 	}
+	printk(KERN_INFO "io_sqe_buffer_register: io_pin_pages() returned %d pages in %llu us (%lld ns)\n", 
+	       nr_pages, elapsed_us, elapsed_ns);
 
 	/* If it's huge page(s), try to coalesce them into fewer bvec entries */
 	if (nr_pages > 1 && io_check_coalesce_buffer(pages, nr_pages, &data)) {
@@ -803,16 +816,19 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 			coalesced = io_coalesce_buffer(&pages, &nr_pages, &data);
 	}
 
+
 	imu = io_alloc_imu(ctx, nr_pages);
 	if (!imu)
 		goto done;
-
+       // printk(KERN_INFO "io_sqe_buffer_register: io_alloc_imu allocated imu for %d bvecs\n", nr_pages);
 	imu->nr_bvecs = nr_pages;
 	ret = io_buffer_account_pin(ctx, pages, nr_pages, imu, last_hpage);
 	if (ret)
 		goto done;
+	//printk(KERN_INFO "io_sqe_buffer_register: io_buffer_account_pin accounted %d pages\n", imu->nr_bvecs);
 
 	size = iov->iov_len;
+	//printk(KERN_INFO "io_sqe_buffer_register: buffer size %zu bytes\n", size);
 	/* store original address for later verification */
 	imu->ubuf = (unsigned long) iov->iov_base;
 	imu->len = iov->iov_len;
@@ -823,15 +839,19 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	imu->dir = IO_IMU_DEST | IO_IMU_SOURCE;
 	if (coalesced)
 		imu->folio_shift = data.folio_shift;
+	else if (nr_pages ==1 && PageCompound(pages[0]))
+		imu->folio_shift = folio_shift(page_folio(pages[0]));
 	refcount_set(&imu->refs, 1);
 
 	off = (unsigned long)iov->iov_base & ~PAGE_MASK;
-	if (coalesced)
+	if (coalesced){
+                //printk(KERN_INFO "io_sqe_buffer_register: coalesced buffer with folio_shift %u, first_folio_page_idx %u\n", data.folio_shift, data.first_folio_page_idx);
 		off += data.first_folio_page_idx << PAGE_SHIFT;
+	}
 
 	node->buf = imu;
 	ret = 0;
-
+        printk(KERN_INFO "io_sqe_buffer_register: imu->folio_shift %u, off %lu\n", imu->folio_shift, off);
 	for (i = 0; i < nr_pages; i++) {
 		size_t vec_len;
 
@@ -863,6 +883,8 @@ int io_sqe_buffers_register(struct io_ring_ctx *ctx, void __user *arg,
 	struct iovec fast_iov, *iov = &fast_iov;
 	const struct iovec __user *uvec;
 	int i, ret;
+	ktime_t start_time1, end_time1;
+	s64 elapsed_ns1; u64 elapsed_us1;
 
 	BUILD_BUG_ON(IORING_MAX_REG_BUFFERS >= (1u << 16));
 
@@ -900,8 +922,12 @@ int io_sqe_buffers_register(struct io_ring_ctx *ctx, void __user *arg,
 				break;
 			}
 		}
-
+                start_time1 = ktime_get();
 		node = io_sqe_buffer_register(ctx, iov, &last_hpage);
+		end_time1 = ktime_get();
+		elapsed_ns1 = ktime_to_ns(ktime_sub(end_time1, start_time1));
+		elapsed_us1 = elapsed_ns1 / 1000;
+		printk(KERN_INFO "gets invokedtime: io_sqe_buffer_register for buffer %d returned in %llu us (%lld ns)\n", i, elapsed_us1, elapsed_ns1);
 		if (IS_ERR(node)) {
 			ret = PTR_ERR(node);
 			break;

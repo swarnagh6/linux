@@ -12,6 +12,7 @@
 #include <linux/compat.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
+#include <linux/ktime.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -26,6 +27,10 @@
 
 static void io_complete_rw(struct kiocb *kiocb, long res);
 static void io_complete_rw_iopoll(struct kiocb *kiocb, long res);
+
+/* Global counters for write_iter timing - defined here, declared extern in io_uring.h */
+atomic64_t total_write_iter_time_ms = ATOMIC64_INIT(0);
+atomic64_t total_write_iter_calls = ATOMIC64_INIT(0);
 
 struct io_rw {
 	/* NOTE: kiocb has the file as the first member, so don't do it here */
@@ -1170,8 +1175,13 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		return -EAGAIN;
 	kiocb->ki_flags |= IOCB_WRITE;
 
-	if (likely(req->file->f_op->write_iter))
+	if (likely(req->file->f_op->write_iter)) {
+                ktime_t t = ktime_get();
 		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
+		s64 delta = ktime_to_ns(ktime_get()) - ktime_to_ns(t);
+		atomic64_add(delta/1000000, &total_write_iter_time_ms);
+		atomic64_inc(&total_write_iter_calls);
+	}
 	else if (req->file->f_op->write)
 		ret2 = loop_rw_iter(WRITE, rw, &io->iter);
 	else

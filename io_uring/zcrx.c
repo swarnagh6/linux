@@ -194,13 +194,22 @@ static int io_import_umem(struct io_zcrx_ifq *ifq,
 {
 	struct page **pages;
 	int nr_pages, ret;
+	u64 pin_start_ns, pin_end_ns, pin_duration_ns;
+	unsigned long area_size = area_reg->len;
 
 	if (area_reg->dmabuf_fd)
 		return -EINVAL;
 	if (!area_reg->addr)
 		return -EFAULT;
+
+	/* Measure io_pin_pages() execution time */
+	pin_start_ns = ktime_get_ns();
 	pages = io_pin_pages((unsigned long)area_reg->addr, area_reg->len,
 				   &nr_pages);
+	pin_end_ns = ktime_get_ns();
+	pin_duration_ns = pin_end_ns - pin_start_ns;
+
+	printk(KERN_INFO "ZCRX_PERF: io_pin_pages() for nr_pages=%d\n took %llu ns\n", nr_pages, pin_duration_ns);
 	if (IS_ERR(pages))
 		return PTR_ERR(pages);
 

@@ -9,6 +9,8 @@
 #include <linux/io_uring.h>
 #include <linux/io_uring_types.h>
 #include <asm/shmparam.h>
+#include <linux/mm_inline.h>
+#include <linux/ktime.h>
 
 #include "memmap.h"
 #include "kbuf.h"
@@ -62,6 +64,7 @@ struct page **io_pin_pages(unsigned long uaddr, unsigned long len, int *npages)
 
 	ret = pin_user_pages_fast(uaddr, nr_pages, FOLL_WRITE | FOLL_LONGTERM,
 					pages);
+        printk(KERN_INFO "io_pin_pages_upstream: ret=%d , nr_pages=%u\n", ret, nr_pages);
 	/* success, mapped all pages */
 	if (ret == nr_pages) {
 		*npages = nr_pages;
@@ -78,6 +81,81 @@ struct page **io_pin_pages(unsigned long uaddr, unsigned long len, int *npages)
 	kvfree(pages);
 	return ERR_PTR(ret);
 }
+EXPORT_SYMBOL_GPL(io_pin_pages);
+
+struct page **io_pin_pages_thp_aware(unsigned long uaddr, unsigned long len, int *npages)
+{
+	unsigned long start, end, nr_pages;
+	struct page **pages;
+	int ret;
+
+	if (check_add_overflow(uaddr, len, &end))
+		return ERR_PTR(-EOVERFLOW);
+	if (check_add_overflow(end, PAGE_SIZE - 1, &end))
+		return ERR_PTR(-EOVERFLOW);
+
+	end = end >> PAGE_SHIFT;
+	start = uaddr >> PAGE_SHIFT;
+	nr_pages = end - start;
+	if (WARN_ON_ONCE(!nr_pages))
+		return ERR_PTR(-EINVAL);
+	if (WARN_ON_ONCE(nr_pages > INT_MAX))
+		return ERR_PTR(-EOVERFLOW);
+
+	pages = kvmalloc_objs(struct page *, nr_pages, GFP_KERNEL_ACCOUNT);
+	if (!pages)
+		return ERR_PTR(-ENOMEM);
+
+	ret = pin_user_pages_fast(uaddr, nr_pages, FOLL_WRITE | FOLL_LONGTERM,
+				pages);
+        printk(KERN_INFO "io_pin_pages_thp_aware: ret=%d , nr_pages=%u\n", ret, nr_pages);
+	if (ret == nr_pages) {
+
+		struct page *head = compound_head(pages[0]);
+		unsigned long nr_pages_contig = compound_nr(head); /* for page backed by HugeTLB or THP */
+		bool override_size = false;
+
+                printk(KERN_INFO "io_pin_pages_thp_aware: nr_pages_contig= %lu\n", nr_pages_contig);
+		if (nr_pages_contig >= nr_pages && compound_head(pages[nr_pages -1]) == head) {
+			/* Reallocate pages array to only 1 entry for THP case */
+			struct folio *folio = page_folio(pages[0]);
+			struct page **thp_pages;
+
+			thp_pages = kvmalloc_objs(struct page *, 1, GFP_KERNEL_ACCOUNT);
+			if (!thp_pages) {
+				/* Fallback: return original array size */
+				*npages = nr_pages;
+				return pages;
+			}
+
+			if(nr_pages > 1)
+		        unpin_user_folio(folio, nr_pages - 1);
+
+			/* Copy compound page head to new 1-entry array */
+			thp_pages[0] = pages[0];
+			kvfree(pages);
+			pages = thp_pages;
+			*npages = 1;
+
+		}
+		else {
+			/* No THP, return original array */
+			*npages = nr_pages;
+		}
+		return pages;
+	}
+	/* partial map, or didn't map anything */
+	if (ret >= 0) {
+		/* if we did partial map, release any pages we did get */
+		if (ret)
+			unpin_user_pages(pages, ret);
+		ret = -EFAULT;
+	}
+
+	kvfree(pages);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(io_pin_pages_thp_aware);
 
 enum {
 	/* memory was vmap'ed for the kernel, freeing the region vunmap's it */
@@ -138,7 +216,7 @@ static int io_region_pin_pages(struct io_mapped_region *mr,
 	struct page **pages;
 	int nr_pages;
 
-	pages = io_pin_pages(reg->user_addr, size, &nr_pages);
+	pages = io_pin_pages_thp_aware(reg->user_addr, size, &nr_pages);
 	if (IS_ERR(pages))
 		return PTR_ERR(pages);
 	if (WARN_ON_ONCE(nr_pages != mr->nr_pages))

@@ -18,6 +18,10 @@
 #include <trace/events/io_uring.h>
 #endif
 
+/* write_iter timing statistics - defined in rw.c */
+extern atomic64_t total_write_iter_time_ms;
+extern atomic64_t total_write_iter_calls;
+
 struct io_rings_layout {
 	/* size of CQ + headers + SQ offset array */
 	size_t rings_size;

@@ -96,6 +96,9 @@
 #include "wait.h"
 #include "bpf_filter.h"
 
+extern atomic64_t total_write_iter_time_ms;
+extern atomic64_t total_write_iter_calls;
+
 #define SQE_COMMON_FLAGS (IOSQE_FIXED_FILE | IOSQE_IO_LINK | \
 			  IOSQE_IO_HARDLINK | IOSQE_ASYNC)
 
@@ -2171,6 +2174,9 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		mmdrop(ctx->mm_account);
 		ctx->mm_account = NULL;
 	}
+	printk(KERN_INFO "SwarnaTotal write_iter time: %lld ms, calls: %lld\n",
+			atomic64_read(&total_write_iter_time_ms),
+			atomic64_read(&total_write_iter_calls));
 	io_rings_free(ctx);
 
 	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
