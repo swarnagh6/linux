@@ -789,7 +789,7 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		return ERR_PTR(-ENOMEM);
 
 	ret = -ENOMEM;
-	pages = io_pin_pages((unsigned long) iov->iov_base, iov->iov_len,
+	pages = io_pin_pages_hugepage_aware((unsigned long) iov->iov_base, iov->iov_len,
 				&nr_pages);
 	if (IS_ERR(pages)) {
 		ret = PTR_ERR(pages);
@@ -823,6 +823,8 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	imu->dir = IO_IMU_DEST | IO_IMU_SOURCE;
 	if (coalesced)
 		imu->folio_shift = data.folio_shift;
+	else if (nr_pages == 1 && PageCompound(pages[0]))
+		imu->folio_shift = folio_shift(page_folio(pages[0]));
 	refcount_set(&imu->refs, 1);
 
 	off = (unsigned long)iov->iov_base & ~PAGE_MASK;
