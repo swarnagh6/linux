@@ -393,11 +393,6 @@ ssize_t iov_iter_extract_bvecs(struct iov_iter *iter, struct bio_vec *bv,
 		size_t max_size, unsigned short *nr_vecs,
 		unsigned short max_vecs, iov_iter_extraction_t extraction_flags);
 
-ssize_t iov_iter_extract_folios(struct iov_iter *i, struct folio_vec ***folios,
-			       size_t maxsize, unsigned int maxpages,
-			       iov_iter_extraction_t extraction_flags,
-			       size_t *offset0, int *nr_folio_vecs);
-
 /**
  * iov_iter_extract_will_pin - Indicate how pages from the iterator will be retained
  * @iter: The iterator
