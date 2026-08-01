@@ -243,6 +243,35 @@ static inline unsigned long folio_page_idx(const struct folio *folio,
 	return page - &folio->page;
 }
 
+/**
+ * folio_range_page - Return the first page of a folio range.
+ * @fr: The folio range.
+ *
+ * Return: The first page described by @fr.
+ */
+static inline struct page *folio_range_page(const struct folio_range *fr)
+{
+	return folio_page(fr->folio, fr->idx);
+}
+
+/**
+ * folio_range_offset - Return the byte offset of a range within its folio.
+ * @fr: The folio range.
+ */
+static inline size_t folio_range_offset(const struct folio_range *fr)
+{
+	return (size_t)fr->idx << PAGE_SHIFT;
+}
+
+/**
+ * folio_range_size - Return the size of a folio range in bytes.
+ * @fr: The folio range.
+ */
+static inline size_t folio_range_size(const struct folio_range *fr)
+{
+	return (size_t)fr->nr_pages << PAGE_SHIFT;
+}
+
 static inline struct folio *lru_to_folio(struct list_head *head)
 {
 	return list_entry((head)->prev, struct folio, lru);
@@ -3282,6 +3311,10 @@ int get_user_pages_fast(unsigned long start, int nr_pages,
 			unsigned int gup_flags, struct page **pages);
 int pin_user_pages_fast(unsigned long start, int nr_pages,
 			unsigned int gup_flags, struct page **pages);
+long pin_user_folio_ranges_fast(unsigned long start, unsigned long nr_pages,
+			unsigned int gup_flags, struct folio_range *frs,
+			unsigned int max_frs, unsigned int *nr_frs);
+void unpin_user_folio_ranges(struct folio_range *frs, unsigned int nr_frs);
 void folio_add_pin(struct folio *folio);
 
 int account_locked_vm(struct mm_struct *mm, unsigned long pages, bool inc);

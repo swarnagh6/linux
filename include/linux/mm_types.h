@@ -548,6 +548,28 @@ FOLIO_MATCH(compound_info, _head_3);
 #undef FOLIO_MATCH
 
 /**
+ * struct folio_range - A range of consecutive pages within a single folio.
+ * @folio: The folio the pages belong to.
+ * @idx: Index of the first page of the range within @folio.
+ * @nr_pages: Number of consecutive pages in the range.
+ *
+ * Describes @nr_pages consecutive pages of @folio, starting at page @idx of
+ * that folio.  All pages of a range are guaranteed to belong to the same
+ * folio, so a range can always be described by a folio + offset + length,
+ * without having to look up the folio of individual pages: something that
+ * will no longer be possible for arbitrary pages once memory descriptors
+ * are split up.
+ *
+ * A range never spans more than one folio: consumers that want the underlying
+ * pages can obtain them with folio_range_page(), consumers that operate on
+ * folios can use @folio together with folio_range_offset() directly.
+ */
+struct folio_range {
+	struct folio *folio;
+	unsigned int idx;
+	unsigned int nr_pages;
+};
+/**
  * struct ptdesc -    Memory descriptor for page tables.
  * @pt_flags: enum pt_flags plus zone/node/section.
  * @pt_rcu_head:      For freeing page table pages.
