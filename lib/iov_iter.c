@@ -1897,6 +1897,92 @@ static unsigned int get_contig_folio_len(struct page **pages,
 
 #define PAGE_PTRS_PER_BVEC     (sizeof(struct bio_vec) / sizeof(struct page *))
 
+/*
+ * Upper limit on the number of pages a single GUP-fast walk is asked to look
+ * at.  One folio range covers many pages, so a caller usually gets everything
+ * it asked for in one go; if not, it simply comes back for more.
+ */
+#define EXTRACT_MAX_PAGES	4096
+
+/*
+ * Extract bvecs from a user-backed iterator by pinning folio ranges: GUP
+ * already returns consecutive pages of a folio as a single range, so each
+ * range simply becomes one bvec and no page array is needed.
+ */
+static ssize_t iov_iter_extract_user_bvecs(struct iov_iter *iter,
+		struct bio_vec *bv, size_t max_size, unsigned short *nr_vecs,
+		unsigned short max_vecs, iov_iter_extraction_t extraction_flags)
+{
+	unsigned short entries_left = max_vecs - *nr_vecs;
+	unsigned int gup_flags = 0, nr_frs = 0, i;
+	unsigned long addr, nr_pages;
+	struct folio_range *frs;
+	size_t offset, left, len;
+	long res;
+
+	max_size = min_t(size_t, min_t(size_t, max_size, iter->count),
+			 MAX_RW_COUNT);
+	if (unlikely(!max_size))
+		return -EFAULT;
+	if (WARN_ON_ONCE(!entries_left))
+		return -ENOMEM;
+
+	if (iter->data_source == ITER_DEST)
+		gup_flags |= FOLL_WRITE;
+	if (extraction_flags & ITER_ALLOW_P2PDMA)
+		gup_flags |= FOLL_PCI_P2PDMA;
+	if (iter->nofault)
+		gup_flags |= FOLL_NOFAULT;
+
+	addr = first_iovec_segment(iter, &max_size);
+	offset = addr % PAGE_SIZE;
+	addr &= PAGE_MASK;
+	nr_pages = min_t(unsigned long,
+			 DIV_ROUND_UP(max_size + offset, PAGE_SIZE),
+			 EXTRACT_MAX_PAGES);
+
+	/*
+	 * A folio range is never bigger than a bvec and turns into exactly one
+	 * bvec, so the ranges can be pinned right into the array that is about
+	 * to be filled and get converted in place.  Move them up as far as
+	 * possible so that filling bvecs from the front cannot overwrite a
+	 * range that has not been converted yet.
+	 */
+	BUILD_BUG_ON(sizeof(struct folio_range) > sizeof(struct bio_vec));
+	frs = (struct folio_range *)(bv + max_vecs) - entries_left;
+
+	res = pin_user_folio_ranges_fast(addr, nr_pages, gup_flags, frs,
+					 entries_left, &nr_frs);
+	if (unlikely(res <= 0))
+		return res ? res : -EFAULT;
+
+	max_size = min_t(size_t, max_size, res * PAGE_SIZE - offset);
+	iov_iter_advance(iter, max_size);
+
+	for (i = 0, left = max_size; left && i < nr_frs; i++) {
+		struct folio_range fr = frs[i];
+		struct page *page = folio_range_page(&fr);
+
+		if (*nr_vecs > 0 &&
+		    !zone_device_pages_have_same_pgmap(bv[*nr_vecs - 1].bv_page,
+						       page))
+			break;
+
+		len = min(folio_range_size(&fr) - offset, left);
+		bvec_set_folio(&bv[(*nr_vecs)++], fr.folio, len,
+			       folio_range_offset(&fr) + offset);
+		left -= len;
+		offset = 0;
+	}
+
+	/* Drop the pins of everything we could not turn into a bvec. */
+	if (unlikely(left))
+		unpin_user_folio_ranges(&frs[i], nr_frs - i);
+
+	iov_iter_revert(iter, left);
+	return max_size - left;
+}
+
 /**
  * iov_iter_extract_bvecs - Extract bvecs from an iterator
  * @iter:	the iterator to extract from
@@ -1922,6 +2008,10 @@ ssize_t iov_iter_extract_bvecs(struct iov_iter *iter, struct bio_vec *bv,
 	size_t left, offset, len;
 	struct page **pages;
 	ssize_t size;
+
+	if (likely(user_backed_iter(iter)))
+		return iov_iter_extract_user_bvecs(iter, bv, max_size, nr_vecs,
+						   max_vecs, extraction_flags);
 
 	/*
 	 * Move page array up in the allocated memory for the bio vecs as far as
