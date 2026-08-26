@@ -1559,6 +1559,12 @@ static long __get_user_pages(struct mm_struct *mm,
 			ret = check_vma_flags(vma, gup_flags);
 			if (ret)
 				goto out;
+			if (out && out->frs && (vma->vm_flags & VM_MIXEDMAP)) {
+				trace_printk("gup_folio: SLOW path bail VM_MIXEDMAP vma flags=%lx\n",
+						vma->vm_flags);
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
 		}
 retry:
 		/*
@@ -1597,6 +1603,7 @@ retry:
 			 */
 			if (out) {
 				ret = PTR_ERR(page);
+				printk("gup_folio: SLOW path bail on no valid struct page\n");
 				goto out;
 			}
 		} else if (IS_ERR(page)) {
@@ -3086,8 +3093,11 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 		if (!pte_access_permitted(pte, flags & FOLL_WRITE))
 			break;
 
-		if (pte_special(pte))
+		if (pte_special(pte)) {
+			trace_printk("gup_folio: FAST bail special pte addr=%lx, pfn=%lx\n", 
+					addr, pte_pfn(pte));
 			break;
+		}
 
 		/* If it's not marked as special it must have a valid memmap. */
 		VM_WARN_ON_ONCE(!pfn_valid(pte_pfn(pte)));
@@ -3135,6 +3145,10 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 			gup_put_folio(folio, 1, flags);
 			break;
 		}
+
+		/* proves FAST never consults vma flags before pinning non-special pte */
+		trace_printk("gup_folio: FAST pin normal pte addr=%lx, pfn=%lx\n",
+				addr, pte_pfn(pte));
 
 		if (!pte_write(pte) && gup_must_unshare(NULL, flags, page)) {
 			gup_put_folio(folio, 1, flags);
@@ -3211,6 +3225,11 @@ static int gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 		gup_put_folio(folio, refs, flags);
 		return 0;
 	}
+
+	/* proves FAST never consults vma flags before pinning a huge (pmd-leaf) page */
+	trace_printk("gup_folio: FAST pin pmd leaf addr=%lx, pfn=%lx, refs=%d\n",
+			addr, page_to_pfn(page), refs);
+
 	if (!pmd_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
 		gup_put_folio(folio, refs, flags);
 		return 0;
@@ -3254,6 +3273,10 @@ static int gup_fast_pud_leaf(pud_t orig, pud_t *pudp, unsigned long addr,
 		gup_put_folio(folio, refs, flags);
 		return 0;
 	}
+
+	/* proves FAST never consults vma flags before pinning a huge (pud-leaf) page */
+	trace_printk("gup_folio: FAST pin pud leaf addr=%lx, pfn=%lx, refs=%d\n",
+			addr, page_to_pfn(page), refs);
 
 	if (!pud_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
 		gup_put_folio(folio, refs, flags);
@@ -3656,6 +3679,10 @@ long pin_user_folio_ranges_fast(unsigned long start, unsigned long nr_pages,
 		.max_frs = max_frs,
 	};
 	long ret;
+
+	/* proves whether GUP is even reached for this request at all */
+	trace_printk("gup_folio: pin_user_folio_ranges_fast entry start=%lx nr_pages=%lu\n",
+			start, nr_pages);
 
 	if (WARN_ON_ONCE(!frs || !max_frs))
 		return -EINVAL;
