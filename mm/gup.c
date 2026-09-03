@@ -3064,9 +3064,16 @@ static bool gup_fast_record_run(struct gup_out *out, struct folio *folio,
  *
  * To pin the page, GUP-fast needs to do below in order:
  * (1) pin the page (by prefetching pte), then (2) check pte not changed.
- * This check is however applicable only to the first page of every subsequent
- * run, since it is skipped for remaining pages that are part of the same folio
- * and hence the same run.
+ *
+ * Under FOLL_PIN, this full sequence is only repeated for the first page of
+ * each run of consecutive pages of the same folio: the pin taken for that
+ * first page (plus the smp_mb__after_atomic() in try_grab_folio_fast())
+ * orders against a concurrent folio_try_share_anon_rmap_*(), so the
+ * remaining pages of the run only need the lighter pte-level checks, not a
+ * fresh pin + pmd/pte revalidation each.  That ordering guarantee is
+ * FOLL_PIN-specific (see gup_must_unshare()), so under FOLL_GET runs are
+ * never coalesced: every page still does the full (1)+(2) sequence below,
+ * matching the pre-run-coalescing behaviour exactly.
  *
  * For the rest of pgtable operations where pgtable updates can be racy
  * with GUP-fast, we need to do (1) clear pte, then (2) check whether page
@@ -3080,7 +3087,7 @@ static bool gup_fast_record_run(struct gup_out *out, struct folio *folio,
  * also check pmd here to make sure pmd doesn't change (corresponds to
  * pmdp_collapse_flush() in the THP collapse code path).
  */
-static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
+static int gup_fast_pte_range_pin(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 		unsigned long end, unsigned int flags, struct gup_out *out)
 {
 	struct folio *folio = NULL;
@@ -3195,6 +3202,86 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 
 	pte_unmap(ptem);
 	return ret;
+}
+
+/*
+ * FOLL_GET counterpart of gup_fast_pte_range_pin(): identical per-page checks,
+ * but never coalesces a run. FOLL_GET has no pin-based ordering against a
+ * concurrent folio_try_share_anon_rmap_*()/COW-break (gup_must_unshare() is a
+ * no-op without FOLL_PIN), so every page must redo its own pin + pmd/pte
+ * revalidation rather than relying on a run's first-page check.
+ */
+static int gup_fast_pte_range_get(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
+		unsigned long end, unsigned int flags, struct gup_out *out)
+{
+	pte_t *ptep, *ptem;
+	int ret;
+
+	ptem = ptep = pte_offset_map(&pmd, addr);
+	if (!ptep)
+		return 0;
+	do {
+		pte_t pte = ptep_get_lockless(ptep);
+		struct folio *folio;
+		struct page *page;
+
+		if (pte_protnone(pte))
+			break;
+
+		if (!pte_access_permitted(pte, flags & FOLL_WRITE))
+			break;
+
+		if (pte_special(pte)) {
+			trace_printk("gup_folio: FAST bail special pte addr=%lx, pfn=%lx\n",
+					addr, pte_pfn(pte));
+			break;
+		}
+
+		/* If it's not marked as special it must have a valid memmap. */
+		VM_WARN_ON_ONCE(!pfn_valid(pte_pfn(pte)));
+		page = pte_page(pte);
+
+		folio = try_grab_folio_fast(page, 1, flags);
+		if (!folio)
+			break;
+
+		if (unlikely(pmd_val(pmd) != pmd_val(pmdp_get_lockless(pmdp))) ||
+		    unlikely(pte_val(pte) != pte_val(ptep_get_lockless(ptep)))) {
+			gup_put_folio(folio, 1, flags);
+			break;
+		}
+
+		if (!gup_fast_folio_allowed(folio, flags)) {
+			gup_put_folio(folio, 1, flags);
+			trace_printk("gup_folio: FAST bail no mapping addr=%lx, pfn=%lx\n",
+					addr, pte_pfn(pte));
+			break;
+		}
+
+		if (!pte_write(pte) && gup_must_unshare(NULL, flags, page)) {
+			gup_put_folio(folio, 1, flags);
+			break;
+		}
+
+		if (!gup_fast_record_run(out, folio, page, 1, flags))
+			break;
+
+		folio_set_referenced(folio);
+	} while (ptep++, addr += PAGE_SIZE, addr != end);
+
+	/* Only tell the caller to continue if we walked the whole range. */
+	ret = addr == end;
+
+	pte_unmap(ptem);
+	return ret;
+}
+
+static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
+		unsigned long end, unsigned int flags, struct gup_out *out)
+{
+	if (flags & FOLL_PIN)
+		return gup_fast_pte_range_pin(pmd, pmdp, addr, end, flags, out);
+	return gup_fast_pte_range_get(pmd, pmdp, addr, end, flags, out);
 }
 #else
 
