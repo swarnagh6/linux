@@ -1975,9 +1975,8 @@ static ssize_t iov_iter_extract_user_bvecs(struct iov_iter *iter,
 		offset = 0;
 	}
 
-	/* Drop the pins of everything we could not turn into a bvec. */
-	if (unlikely(left))
-		unpin_user_folio_ranges(&frs[i], nr_frs - i);
+	/* Unpins everything not converted to a bvec; no-op once i == nr_frs. */
+	unpin_user_folio_ranges(&frs[i], nr_frs - i);
 
 	iov_iter_revert(iter, left);
 	return max_size - left;

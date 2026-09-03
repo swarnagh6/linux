@@ -257,6 +257,8 @@ static inline struct page *folio_range_page(const struct folio_range *fr)
 /**
  * folio_range_offset - Return the byte offset of a range within its folio.
  * @fr: The folio range.
+ *
+ * Return: The byte offset into @fr.
  */
 static inline size_t folio_range_offset(const struct folio_range *fr)
 {
@@ -266,6 +268,8 @@ static inline size_t folio_range_offset(const struct folio_range *fr)
 /**
  * folio_range_size - Return the size of a folio range in bytes.
  * @fr: The folio range.
+ *
+ * Return: The size of the folio range.
  */
 static inline size_t folio_range_size(const struct folio_range *fr)
 {

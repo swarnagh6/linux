@@ -21,7 +21,6 @@
 #include <linux/folio_batch.h>
 #include <linux/sched/mm.h>
 #include <linux/shmem_fs.h>
-#include <linux/bvec.h>
 
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
@@ -556,8 +555,6 @@ struct gup_out {
 };
 
 #define GUP_OUT_PAGES(_pages)		((struct gup_out){ .pages = (_pages) })
-
-static_assert(sizeof(struct folio_range) == sizeof(struct bio_vec));
 
 /*
  * Whether no further folio range can be recorded.  The @pages array is sized
@@ -2144,8 +2141,8 @@ int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
 	return ret;	/* 0 or negative error code */
 }
 #else /* CONFIG_MMU */
-static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
-		unsigned long nr_pages, struct page **pages,
+static long __get_user_pages_locked_out(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, struct gup_out *out,
 		int *locked, unsigned int foll_flags)
 {
 	struct vm_area_struct *vma;
@@ -2185,10 +2182,13 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
 		    !(vm_flags & vma->vm_flags))
 			break;
 
-		if (pages) {
-			pages[i] = virt_to_page((void *)start);
-			if (pages[i])
-				get_page(pages[i]);
+		if (out) {
+			struct page *page = virt_to_page((void *)start);
+
+			if (page)
+				get_page(page);
+			out->pages[i] = page;
+			out->nr_pages++;
 		}
 
 		start = (start + PAGE_SIZE) & PAGE_MASK;
@@ -2200,6 +2200,17 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
 	}
 
 	return i ? : -EFAULT;
+}
+
+static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, struct page **pages,
+		int *locked, unsigned int foll_flags)
+{
+	struct gup_out out = GUP_OUT_PAGES(pages);
+
+	return __get_user_pages_locked_out(mm, start, nr_pages,
+					   pages ? &out : NULL, locked,
+					   foll_flags);
 }
 #endif /* !CONFIG_MMU */
 
@@ -2965,9 +2976,6 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
 	if (IS_ENABLED(CONFIG_SECRETMEM) && !folio_test_large(folio))
 		check_secretmem = true;
 
-	if (!reject_file_backed && !check_secretmem)
-		return true;
-
 	if (WARN_ON_ONCE(folio_test_slab(folio)))
 		return false;
 
@@ -2993,9 +3001,11 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
 	mapping = READ_ONCE(folio->mapping);
 
 	/*
-	 * The mapping may have been truncated, in any case we cannot determine
-	 * if this mapping is safe - fall back to slow path to determine how to
-	 * proceed.
+	 * No mapping at all (e.g. a bare struct page a driver installed via
+	 * vm_insert_page(), such as in a VM_MIXEDMAP vma) has no folio
+	 * identity to reason about here and no vma to consult either -
+	 * always defer to the slow path, unconditionally of reject_file_backed
+	 * or check_secretmem, so the vma-level check downstream is reachable.
 	 */
 	if (!mapping)
 		return false;
@@ -3004,6 +3014,9 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
 	mapping_flags = (unsigned long)mapping & FOLIO_MAPPING_FLAGS;
 	if (mapping_flags)
 		return mapping_flags & FOLIO_MAPPING_ANON;
+
+	if (!reject_file_backed && !check_secretmem)
+		return true;
 
 	/*
 	 * At this point, we know the mapping is non-null and points to an
@@ -3051,6 +3064,9 @@ static bool gup_fast_record_run(struct gup_out *out, struct folio *folio,
  *
  * To pin the page, GUP-fast needs to do below in order:
  * (1) pin the page (by prefetching pte), then (2) check pte not changed.
+ * This check is however applicable only to the first page of every subsequent
+ * run, since it is skipped for remaining pages that are part of the same folio
+ * and hence the same run.
  *
  * For the rest of pgtable operations where pgtable updates can be racy
  * with GUP-fast, we need to do (1) clear pte, then (2) check whether page
@@ -3143,6 +3159,8 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
 
 		if (!gup_fast_folio_allowed(folio, flags)) {
 			gup_put_folio(folio, 1, flags);
+			trace_printk("gup_folio: FAST bail no mapping addr=%lx, pfn=%lx\n",
+					addr, pte_pfn(pte));
 			break;
 		}
 

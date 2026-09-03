@@ -569,6 +569,7 @@ struct folio_range {
 	unsigned int idx;
 	unsigned int nr_pages;
 };
+
 /**
  * struct ptdesc -    Memory descriptor for page tables.
  * @pt_flags: enum pt_flags plus zone/node/section.
