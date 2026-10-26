@@ -3146,7 +3146,7 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
  */
 static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	unsigned long nr_pages = 0, nr_batch;
 	struct folio *folio = NULL;
@@ -3158,7 +3158,6 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 	do {
 		pte_t pte = ptep_get_lockless(ptep);
 		struct page *page;
-		unsigned long i;
 
 		nr_batch = 1;
 
@@ -3229,8 +3228,7 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 			nr_batch = 1;
 
 		folio_set_referenced(folio);
-		for (i = 0; i < nr_batch; i++)
-			pages[nr_pages + i] = page + i;
+		gup_out_add_range(out, folio, page, nr_batch);
 		nr_pages += nr_batch;
 		folio = NULL;
 	} while (ptep += nr_batch, addr += nr_batch * PAGE_SIZE, addr != end);
@@ -3254,7 +3252,7 @@ out:
  */
 static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	return 0;
 }
@@ -3262,11 +3260,11 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 
 static unsigned long gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	struct page *mapped_page, *page;
 	struct folio *folio;
-	unsigned long nr_pages, i;
+	unsigned long nr_pages;
 
 	/* See gup_fast_pte_range() */
 	if (pmd_protnone(orig))
@@ -3301,19 +3299,18 @@ static unsigned long gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp,
 		return 0;
 	}
 
-	for (i = 0; i < nr_pages; i++)
-		*(pages++) = page++;
+	gup_out_add_range(out, folio, page, nr_pages);
 	folio_set_referenced(folio);
 	return nr_pages;
 }
 
 static unsigned long gup_fast_pud_leaf(pud_t orig, pud_t *pudp,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	struct page *mapped_page, *page;
 	struct folio *folio;
-	unsigned long nr_pages, i;
+	unsigned long nr_pages;
 
 	if (!pud_access_permitted(orig, flags & FOLL_WRITE))
 		return 0;
@@ -3345,15 +3342,14 @@ static unsigned long gup_fast_pud_leaf(pud_t orig, pud_t *pudp,
 		return 0;
 	}
 
-	for (i = 0; i < nr_pages; i++)
-		*(pages++) = page++;
+	gup_out_add_range(out, folio, page, nr_pages);
 	folio_set_referenced(folio);
 	return nr_pages;
 }
 
 static unsigned long gup_fast_pmd_range(pud_t *pudp, pud_t pud,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	unsigned long next, nr_pages = 0, chunk_nr_pages;
 	pmd_t *pmdp;
@@ -3369,12 +3365,12 @@ static unsigned long gup_fast_pmd_range(pud_t *pudp, pud_t pud,
 		if (unlikely(pmd_leaf(pmd))) {
 			chunk_nr_pages = gup_fast_pmd_leaf(pmd, pmdp, addr,
 							   next, flags,
-							   &pages[nr_pages]);
+							   out);
 
 		} else
 			chunk_nr_pages = gup_fast_pte_range(pmd, pmdp, addr,
 							    next, flags,
-							    &pages[nr_pages]);
+							    out);
 		nr_pages += chunk_nr_pages;
 		if (chunk_nr_pages != (next - addr) >> PAGE_SHIFT)
 			break;
@@ -3385,7 +3381,7 @@ static unsigned long gup_fast_pmd_range(pud_t *pudp, pud_t pud,
 
 static unsigned long gup_fast_pud_range(p4d_t *p4dp, p4d_t p4d,
 		unsigned long addr, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	unsigned long next, nr_pages = 0, chunk_nr_pages;
 	pud_t *pudp;
@@ -3400,11 +3396,11 @@ static unsigned long gup_fast_pud_range(p4d_t *p4dp, p4d_t p4d,
 		if (unlikely(pud_leaf(pud)))
 			chunk_nr_pages = gup_fast_pud_leaf(pud, pudp, addr,
 							   next, flags,
-							   &pages[nr_pages]);
+							   out);
 		else
 			chunk_nr_pages = gup_fast_pmd_range(pudp, pud, addr,
 							    next, flags,
-							    &pages[nr_pages]);
+							    out);
 		nr_pages += chunk_nr_pages;
 		if (chunk_nr_pages != (next - addr) >> PAGE_SHIFT)
 			break;
@@ -3414,7 +3410,7 @@ static unsigned long gup_fast_pud_range(p4d_t *p4dp, p4d_t p4d,
 }
 
 static unsigned long gup_fast_p4d_range(pgd_t *pgdp, pgd_t pgd, unsigned long addr,
-		unsigned long end, unsigned int flags, struct page **pages)
+		unsigned long end, unsigned int flags, struct gup_out *out)
 {
 	unsigned long next, nr_pages = 0, chunk_nr_pages;
 	p4d_t *p4dp;
@@ -3428,7 +3424,7 @@ static unsigned long gup_fast_p4d_range(pgd_t *pgdp, pgd_t pgd, unsigned long ad
 			break;
 		BUILD_BUG_ON(p4d_leaf(p4d));
 		chunk_nr_pages = gup_fast_pud_range(p4dp, p4d, addr, next,
-						    flags, &pages[nr_pages]);
+						    flags, out);
 		nr_pages += chunk_nr_pages;
 		if (chunk_nr_pages != (next - addr) >> PAGE_SHIFT)
 			break;
@@ -3439,7 +3435,7 @@ static unsigned long gup_fast_p4d_range(pgd_t *pgdp, pgd_t pgd, unsigned long ad
 
 static unsigned long gup_fast_pgd_range(unsigned long addr,
 		unsigned long end, unsigned int flags,
-		struct page **pages)
+		struct gup_out *out)
 {
 	unsigned long next, nr_pages = 0, chunk_nr_pages;
 	pgd_t *pgdp;
@@ -3453,7 +3449,7 @@ static unsigned long gup_fast_pgd_range(unsigned long addr,
 			break;
 		BUILD_BUG_ON(pgd_leaf(pgd));
 		chunk_nr_pages = gup_fast_p4d_range(pgdp, pgd, addr, next,
-						    flags, &pages[nr_pages]);
+						    flags, out);
 		nr_pages += chunk_nr_pages;
 		if (chunk_nr_pages != (next - addr) >> PAGE_SHIFT)
 			break;
@@ -3464,7 +3460,7 @@ static unsigned long gup_fast_pgd_range(unsigned long addr,
 #else
 static inline unsigned long gup_fast_pgd_range(unsigned long addr,
 		unsigned long end, unsigned int flags,
-		struct page **pages)
+		struct gup_out *out)
 {
 	return 0;
 }
@@ -3481,11 +3477,26 @@ static bool gup_fast_permitted(unsigned long start, unsigned long end)
 }
 #endif
 
-static unsigned long gup_fast(unsigned long start, unsigned long end,
-		unsigned int gup_flags, struct page **pages)
+/*
+ * Undo what GUP-fast recorded in @out.
+ *
+ * Don't perform any sanity checks because we might have raced with fork() and
+ * some anonymous pages might now actually be shared -- which is why we're
+ * unpinning after all.
+ */
+static void gup_fast_unpin(struct gup_out *out)
 {
-	unsigned long flags, nr_pinned;
+	gup_fast_unpin_user_pages(out->pages, out->nr_pages);
+	out->nr_pages = 0;
+}
+
+static unsigned long gup_fast(unsigned long start, unsigned long end,
+		unsigned int gup_flags, struct gup_out *out)
+{
+	unsigned long flags;
 	unsigned seq;
+
+	VM_WARN_ON_ONCE(out->nr_pages);
 
 	if (!IS_ENABLED(CONFIG_HAVE_GUP_FAST) ||
 	    !gup_fast_permitted(start, end))
@@ -3508,7 +3519,7 @@ static unsigned long gup_fast(unsigned long start, unsigned long end,
 	 * that come from callers of tlb_remove_table_sync_one().
 	 */
 	local_irq_save(flags);
-	nr_pinned = gup_fast_pgd_range(start, end, gup_flags, pages);
+	gup_fast_pgd_range(start, end, gup_flags, out);
 	local_irq_restore(flags);
 
 	/*
@@ -3517,22 +3528,22 @@ static unsigned long gup_fast(unsigned long start, unsigned long end,
 	 */
 	if (gup_flags & FOLL_PIN) {
 		if (read_seqcount_retry(&current->mm->write_protect_seq, seq)) {
-			gup_fast_unpin_user_pages(pages, nr_pinned);
+			gup_fast_unpin(out);
 			return 0;
 		} else {
-			sanity_check_pinned_pages(pages, nr_pinned);
+			sanity_check_pinned_pages(out->pages, out->nr_pages);
 		}
 	}
-	return nr_pinned;
+	return out->nr_pages;
 }
 
-static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
-		unsigned int gup_flags, struct page **pages)
+static long gup_fast_fallback_out(unsigned long start, unsigned long nr_pages,
+		unsigned int gup_flags, struct gup_out *out)
 {
 	unsigned long len, end;
 	unsigned long nr_pinned;
 	int locked = 0;
-	int ret;
+	long ret;
 
 	if (WARN_ON_ONCE(gup_flags & ~(FOLL_WRITE | FOLL_LONGTERM |
 				       FOLL_FORCE | FOLL_PIN | FOLL_GET |
@@ -3553,16 +3564,15 @@ static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
 	if (end > TASK_SIZE_MAX)
 		return -EFAULT;
 
-	nr_pinned = gup_fast(start, end, gup_flags, pages);
+	nr_pinned = gup_fast(start, end, gup_flags, out);
 	if (nr_pinned == nr_pages || gup_flags & FOLL_FAST_ONLY)
 		return nr_pinned;
 
 	/* Slow path: try to get the remaining pages with get_user_pages */
 	start += nr_pinned << PAGE_SHIFT;
-	pages += nr_pinned;
-	ret = __gup_longterm_locked(current->mm, start, nr_pages - nr_pinned,
-				    pages, &locked,
-				    gup_flags | FOLL_TOUCH | FOLL_UNLOCKABLE);
+	ret = __gup_longterm_locked_out(current->mm, start,
+					nr_pages - nr_pinned, out, &locked,
+					gup_flags | FOLL_TOUCH | FOLL_UNLOCKABLE);
 	if (ret < 0) {
 		/*
 		 * The caller has to unpin the pages we already pinned so
@@ -3573,6 +3583,14 @@ static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
 		return ret;
 	}
 	return ret + nr_pinned;
+}
+
+static int gup_fast_fallback(unsigned long start, unsigned long nr_pages,
+		unsigned int gup_flags, struct page **pages)
+{
+	struct gup_out out = GUP_OUT_PAGES(pages);
+
+	return gup_fast_fallback_out(start, nr_pages, gup_flags, &out);
 }
 
 /**
