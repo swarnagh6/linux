@@ -67,6 +67,39 @@ static inline void sanity_check_pinned_pages(struct page **pages,
 	}
 }
 
+/* See sanity_check_pinned_pages(). */
+static inline void sanity_check_pinned_folio_ranges(struct folio_range *frs,
+						    unsigned int nr_frs)
+{
+	unsigned int i, j;
+
+	if (!IS_ENABLED(CONFIG_DEBUG_VM))
+		return;
+
+	for (i = 0; i < nr_frs; i++) {
+		struct folio *folio = frs[i].folio;
+
+		if (is_zero_folio(folio) || !folio_test_anon(folio))
+			continue;
+
+		if (!folio_test_large(folio) || folio_test_hugetlb(folio)) {
+			VM_WARN_ON_ONCE_FOLIO(!PageAnonExclusive(&folio->page),
+					      folio);
+			continue;
+		}
+
+		if (PageAnonExclusive(&folio->page))
+			continue;
+
+		/* A PTE-mapped THP: each page has to be exclusive. */
+		for (j = 0; j < frs[i].nr_pages; j++) {
+			struct page *page = folio_page(folio, frs[i].idx + j);
+
+			VM_WARN_ON_ONCE_PAGE(!PageAnonExclusive(page), page);
+		}
+	}
+}
+
 /*
  * Return the folio with ref appropriately incremented,
  * or NULL if that failed.
@@ -438,6 +471,23 @@ void unpin_user_folio(struct folio *folio, unsigned long npages)
 EXPORT_SYMBOL(unpin_user_folio);
 
 /**
+ * unpin_user_folio_ranges() - release an array of gup-pinned folio ranges
+ * @frs: array of folio ranges to be released
+ * @nr_frs: number of folio ranges in the @frs array
+ *
+ * For each range in the @frs array, release the pins that
+ * pin_user_folio_ranges_fast() took for its pages.
+ */
+void unpin_user_folio_ranges(struct folio_range *frs, unsigned int nr_frs)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_frs; i++)
+		gup_put_folio(frs[i].folio, frs[i].nr_pages, FOLL_PIN);
+}
+EXPORT_SYMBOL_GPL(unpin_user_folio_ranges);
+
+/**
  * unpin_folios() - release an array of gup-pinned folios.
  * @folios:  array of folios to be marked dirty and released.
  * @nfolios: number of folios in the @folios array.
@@ -485,19 +535,64 @@ static inline void mm_set_has_pinned_flag(struct mm_struct *mm)
 /*
  * Output descriptor of the GUP page table walkers.
  *
- * GUP hands the memory it grabbed back to the caller as an array of pages
- * (@pages).
+ * GUP hands the memory it grabbed back to the caller either as an array of
+ * pages (@pages), or as an array of folio ranges (@frs), where each range
+ * describes consecutive pages of a single folio.  Exactly one of the two is
+ * set.
  *
- * @nr_pages is the number of pages recorded so far: the walkers simply keep
- * appending to the descriptor, no matter how often they are called for a
- * single GUP request.
+ * @nr_pages is the number of pages recorded so far and is maintained in both
+ * cases: the walkers simply keep appending to the descriptor, no matter how
+ * often they are called for a single GUP request.
  */
 struct gup_out {
 	struct page **pages;
+	struct folio_range *frs;
 	unsigned long nr_pages;
+	unsigned int nr_frs;
+	unsigned int max_frs;
 };
 
 #define GUP_OUT_PAGES(_pages)		((struct gup_out){ .pages = (_pages) })
+
+/*
+ * Whether no further folio range can be recorded.  The @pages array is sized
+ * by the caller to hold all requested pages, so it can never run full.
+ */
+static inline bool gup_out_is_full(struct gup_out *out)
+{
+	return out->frs && out->nr_frs == out->max_frs;
+}
+
+static inline bool gup_out_add_folio_range(struct gup_out *out,
+					   struct folio *folio,
+					   struct page *page,
+					   unsigned long nr_pages)
+{
+	unsigned long idx = folio_page_idx(folio, page);
+	struct folio_range *fr;
+
+	/*
+	 * Ranges are only ever grown by walkers that hold a reference on the
+	 * folio for each page they add, so merging with the previous range
+	 * keeps the reference count of that range consistent.
+	 */
+	if (out->nr_frs) {
+		fr = &out->frs[out->nr_frs - 1];
+		if (fr->folio == folio && fr->idx + fr->nr_pages == idx) {
+			fr->nr_pages += nr_pages;
+			return true;
+		}
+	}
+
+	if (out->nr_frs == out->max_frs)
+		return false;
+
+	fr = &out->frs[out->nr_frs++];
+	fr->folio = folio;
+	fr->idx = idx;
+	fr->nr_pages = nr_pages;
+	return true;
+}
 
 /**
  * gup_out_add_range() - record consecutive pages of a single folio
@@ -508,17 +603,27 @@ struct gup_out {
  *
  * The caller must hold a reference (FOLL_GET) or pin (FOLL_PIN) for each of
  * the @nr_pages pages.
+ *
+ * Return: %true if the pages were recorded.  %false if the folio range array
+ * is full, in which case the caller has to release the references it grabbed
+ * for these pages and stop the walk.
  */
-static inline void gup_out_add_range(struct gup_out *out, struct folio *folio,
+static inline bool gup_out_add_range(struct gup_out *out, struct folio *folio,
 			      struct page *page, unsigned long nr_pages)
 {
-	struct page **pages = out->pages + out->nr_pages;
-	unsigned long i;
+	if (out->frs) {
+		if (!gup_out_add_folio_range(out, folio, page, nr_pages))
+			return false;
+	} else {
+		struct page **pages = out->pages + out->nr_pages;
+		unsigned long i;
 
-	for (i = 0; i < nr_pages; i++)
-		pages[i] = page + i;
+		for (i = 0; i < nr_pages; i++)
+			pages[i] = page + i;
+	}
 
 	out->nr_pages += nr_pages;
+	return true;
 }
 
 #ifdef CONFIG_MMU
@@ -749,16 +854,26 @@ static inline bool gup_must_unshare(struct vm_area_struct *vma,
 	return gup_pages_not_requiring_unshare(vma, flags, folio, page, 1) != 1;
 }
 
-/* Record @nr pages starting at @page in @out, and flush their caches. */
-static void gup_fill_pages(struct vm_area_struct *vma, unsigned long address,
-		struct page *page, unsigned long nr, struct gup_out *out)
+/*
+ * Record @nr pages starting at @page, for which the caller holds references
+ * per @flags, in @out, and flush their caches.  If @out has no room for
+ * another folio range, the references are dropped and -ENOSPC is returned.
+ */
+static int gup_fill_pages(struct vm_area_struct *vma, unsigned long address,
+		struct page *page, unsigned long nr, unsigned int flags,
+		struct gup_out *out)
 {
+	struct folio *folio;
 	unsigned long i;
 
 	if (!out)
-		return;
+		return 0;
 
-	gup_out_add_range(out, page_folio(page), page, nr);
+	folio = page_folio(page);
+	if (!gup_out_add_range(out, folio, page, nr)) {
+		gup_put_folio(folio, nr, flags);
+		return -ENOSPC;
+	}
 
 	for (i = 0; i < nr; i++) {
 		struct page *subpage = page + i;
@@ -766,6 +881,8 @@ static void gup_fill_pages(struct vm_area_struct *vma, unsigned long address,
 		flush_anon_page(vma, subpage, address + i * PAGE_SIZE);
 		flush_dcache_page(subpage);
 	}
+
+	return 0;
 }
 
 /*
@@ -781,6 +898,28 @@ static void gup_flush_pages(struct vm_area_struct *vma, unsigned long address,
 
 	if (!out)
 		return;
+
+	if (out->frs) {
+		const struct folio_range *fr = &out->frs[out->nr_frs];
+
+		/*
+		 * The first pages may have been merged into a range that was
+		 * recorded earlier, so walk back from the end of the array.
+		 */
+		while (nr) {
+			unsigned long run = min((--fr)->nr_pages, nr);
+			struct page *page = folio_range_page(fr) +
+					    fr->nr_pages - run;
+
+			nr -= run;
+			for (i = 0; i < run; i++) {
+				flush_anon_page(vma, page + i,
+						address + (nr + i) * PAGE_SIZE);
+				flush_dcache_page(page + i);
+			}
+		}
+		return;
+	}
 
 	pages = out->pages + out->nr_pages - nr;
 	for (i = 0; i < nr; i++) {
@@ -1008,8 +1147,10 @@ static long gup_grab_folio_pages(struct folio *folio,
 		folio_mark_accessed(folio);
 	}
 
-	if (out)
-		gup_out_add_range(out, folio, page, nr);
+	if (out && !gup_out_add_range(out, folio, page, nr)) {
+		gup_put_folio(folio, nr, flags);
+		return -ENOSPC;
+	}
 
 	return 0;
 }
@@ -1212,8 +1353,12 @@ static long follow_pmd_mask(struct vm_area_struct *vma,
 	 * The ref is already held, so the page cannot go away: record the
 	 * pages and flush caches without the pmd lock.
 	 */
-	if (ret > 0)
-		gup_fill_pages(vma, address, page, ret, out);
+	if (ret > 0) {
+		int err = gup_fill_pages(vma, address, page, ret, flags, out);
+
+		if (err)
+			return err;
+	}
 
 	return ret;
 }
@@ -1242,8 +1387,13 @@ static long follow_pud_mask(struct vm_area_struct *vma,
 		 * can be up to HPAGE_PUD_NR pages, too long to flush under a
 		 * spinlock.
 		 */
-		if (ret > 0)
-			gup_fill_pages(vma, address, page, ret, out);
+		if (ret > 0) {
+			int err = gup_fill_pages(vma, address, page, ret,
+						 flags, out);
+
+			if (err)
+				return err;
+		}
 		if (ret)
 			return ret;
 		return no_page_table(vma, flags, address);
@@ -1289,9 +1439,9 @@ static long follow_p4d_mask(struct vm_area_struct *vma,
  *
  * Return: the number of contiguous pages starting at @address that were
  * recorded in @out (if non-NULL), which may be fewer than the pages
- * requested via @end; 0 if no mapping exists at @address; or a negative
- * errno for a mapping to something not represented by a page descriptor
- * (see also vm_normal_page()).
+ * requested via @end; 0 if no mapping exists at @address; -ENOSPC if @out
+ * has no room for another folio range; or a negative errno for a mapping to
+ * something not represented by a page descriptor (see also vm_normal_page()).
  */
 static long follow_page_mask(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end,
@@ -1686,7 +1836,12 @@ static long __get_user_pages(struct mm_struct *mm,
 						out ? &page : NULL);
 				if (ret)
 					goto out;
-				gup_fill_pages(vma, start, page, 1, out);
+				if (gup_fill_pages(vma, start, page, 1,
+						   gup_flags, out)) {
+					/* The folio range array is full. */
+					ret = 0;
+					goto out;
+				}
 				i++;
 				start += PAGE_SIZE;
 				nr_pages--;
@@ -1700,6 +1855,10 @@ static long __get_user_pages(struct mm_struct *mm,
 			ret = check_vma_flags(vma, gup_flags);
 			if (ret)
 				goto out;
+			if (out && out->frs && (vma->vm_flags & VM_MIXEDMAP)) {
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
 		}
 retry:
 		/*
@@ -1743,6 +1902,13 @@ retry:
 				goto out;
 			}
 			nr = 1;
+		} else if (nr == -ENOSPC && out && gup_out_is_full(out)) {
+			/*
+			 * The output can only run out of space when returning
+			 * folio ranges: stop and report what we got so far.
+			 */
+			ret = 0;
+			goto out;
 		} else if (nr < 0) {
 			ret = nr;
 			goto out;
@@ -2294,7 +2460,10 @@ static long __get_user_pages_locked_out(struct mm_struct *mm, unsigned long star
 				err = ret;
 				break;
 			}
-			gup_out_add_range(out, folio, page, 1);
+			if (!gup_out_add_range(out, folio, page, 1)) {
+				gup_put_folio(folio, 1, foll_flags);
+				break;
+			}
 		}
 
 		start = (start + PAGE_SIZE) & PAGE_MASK;
@@ -2749,7 +2918,7 @@ static long __gup_longterm_locked_out(struct mm_struct *mm,
 				  int *locked,
 				  unsigned int gup_flags)
 {
-	unsigned long nr_pages_done;
+	unsigned long nr_pages_done, nr_frs_done;
 	unsigned int flags;
 	long rc, nr_pinned_pages;
 
@@ -2757,7 +2926,12 @@ static long __gup_longterm_locked_out(struct mm_struct *mm,
 		return __get_user_pages_locked_out(mm, start, nr_pages, out,
 						   locked, gup_flags);
 
-	if (WARN_ON_ONCE(!out))
+	/*
+	 * check_and_migrate_movable_pages() cannot deal with folio ranges
+	 * yet, which is why pin_user_folio_ranges_fast() rejects
+	 * FOLL_LONGTERM.
+	 */
+	if (WARN_ON_ONCE(!out || out->frs))
 		return -EINVAL;
 
 	/*
@@ -2765,10 +2939,12 @@ static long __gup_longterm_locked_out(struct mm_struct *mm,
 	 * this call has to be discarded again.
 	 */
 	nr_pages_done = out->nr_pages;
+	nr_frs_done = out->nr_frs;
 
 	flags = memalloc_pin_save();
 	do {
 		out->nr_pages = nr_pages_done;
+		out->nr_frs = nr_frs_done;
 
 		nr_pinned_pages = __get_user_pages_locked_out(mm, start,
 							      nr_pages, out,
@@ -2809,8 +2985,8 @@ static long __gup_longterm_locked(struct mm_struct *mm,
  * Check that the given flags are valid for the exported gup/pup interface, and
  * update them with the required flags that the caller must have set.
  */
-static bool is_valid_gup_args(struct page **pages, int *locked,
-			      unsigned int *gup_flags_p, unsigned int to_set)
+static bool __is_valid_gup_args(bool has_output, int *locked,
+				unsigned int *gup_flags_p, unsigned int to_set)
 {
 	unsigned int gup_flags = *gup_flags_p;
 
@@ -2842,8 +3018,8 @@ static bool is_valid_gup_args(struct page **pages, int *locked,
 	if (WARN_ON_ONCE(!(gup_flags & FOLL_PIN) && (gup_flags & FOLL_LONGTERM)))
 		return false;
 
-	/* Pages input must be given if using GET/PIN */
-	if (WARN_ON_ONCE((gup_flags & (FOLL_GET | FOLL_PIN)) && !pages))
+	/* An output array must be given if using GET/PIN */
+	if (WARN_ON_ONCE((gup_flags & (FOLL_GET | FOLL_PIN)) && !has_output))
 		return false;
 
 	/* We want to allow the pgmap to be hot-unplugged at all times */
@@ -2853,6 +3029,12 @@ static bool is_valid_gup_args(struct page **pages, int *locked,
 
 	*gup_flags_p = gup_flags;
 	return true;
+}
+
+static bool is_valid_gup_args(struct page **pages, int *locked,
+			      unsigned int *gup_flags_p, unsigned int to_set)
+{
+	return __is_valid_gup_args(pages != NULL, locked, gup_flags_p, to_set);
 }
 
 #ifdef CONFIG_MMU
@@ -3048,7 +3230,14 @@ EXPORT_SYMBOL(get_user_pages_unlocked);
  * in the fast path, so instead we whitelist known good cases and if in doubt,
  * fall back to the slow path.
  */
-static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
+/*
+ * @need_folio is set when the caller reports the memory as folio ranges, which
+ * describe memory by its folio.  A page without any mapping might not be a
+ * folio at all (e.g. a bare page a driver installed via vm_insert_page()), so
+ * such pages are left to the slow path, which can consult the vma.
+ */
+static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags,
+				   bool need_folio)
 {
 	bool reject_file_backed = false;
 	struct address_space *mapping;
@@ -3069,7 +3258,7 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
 	if (IS_ENABLED(CONFIG_SECRETMEM) && !folio_test_large(folio))
 		check_secretmem = true;
 
-	if (!reject_file_backed && !check_secretmem)
+	if (!reject_file_backed && !check_secretmem && !need_folio)
 		return true;
 
 	if (WARN_ON_ONCE(folio_test_slab(folio)))
@@ -3104,10 +3293,10 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags)
 	 * Otherwise, a NULL mapping proves this is not a secretmem folio
 	 * (secretmem folios always have a valid mapping to the secretmem
 	 * inode's address_space), so in that case, we can continue with the
-	 * fast path.
+	 * fast path, unless the caller needs it to be a folio.
 	 */
 	if (!mapping)
-		return !reject_file_backed;
+		return !reject_file_backed && !need_folio;
 
 	/* Anonymous folios pose no problem. */
 	mapping_flags = (unsigned long)mapping & FOLIO_MAPPING_FLAGS;
@@ -3181,6 +3370,21 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 		VM_WARN_ON_ONCE(!pfn_valid(pte_pfn(pte)));
 		page = pte_page(pte);
 
+		if (gup_out_is_full(out)) {
+			struct folio_range *last;
+			unsigned long next_idx;
+
+			if (!out->nr_frs)
+				goto out;
+
+			last = &out->frs[out->nr_frs - 1];
+			next_idx = (unsigned long)last->idx + last->nr_pages;
+
+			if (next_idx >= folio_nr_pages(last->folio) ||
+			    page != folio_page(last->folio, next_idx))
+				goto out;
+		}
+
 		folio = try_grab_folio_fast(page, 1, flags);
 		if (!folio)
 			goto out;
@@ -3197,7 +3401,7 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 		    unlikely(pte_val(pte) != pte_val(ptep_get_lockless(ptep))))
 			goto out;
 
-		if (!gup_fast_folio_allowed(folio, flags))
+		if (!gup_fast_folio_allowed(folio, flags, out->frs))
 			goto out;
 
 		if (folio_test_large(folio))
@@ -3228,7 +3432,13 @@ static unsigned long gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp,
 			nr_batch = 1;
 
 		folio_set_referenced(folio);
-		gup_out_add_range(out, folio, page, nr_batch);
+
+		/* Only fails if the caller's output array is full. */
+		if (!gup_out_add_range(out, folio, page, nr_batch)) {
+			gup_put_folio(folio, nr_batch, flags);
+			folio = NULL;
+			goto out;
+		}
 		nr_pages += nr_batch;
 		folio = NULL;
 	} while (ptep += nr_batch, addr += nr_batch * PAGE_SIZE, addr != end);
@@ -3289,7 +3499,7 @@ static unsigned long gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp,
 		return 0;
 	}
 
-	if (!gup_fast_folio_allowed(folio, flags)) {
+	if (!gup_fast_folio_allowed(folio, flags, out->frs)) {
 		gup_put_folio(folio, nr_pages, flags);
 		return 0;
 	}
@@ -3299,7 +3509,11 @@ static unsigned long gup_fast_pmd_leaf(pmd_t orig, pmd_t *pmdp,
 		return 0;
 	}
 
-	gup_out_add_range(out, folio, page, nr_pages);
+	if (!gup_out_add_range(out, folio, page, nr_pages)) {
+		gup_put_folio(folio, nr_pages, flags);
+		return 0;
+	}
+
 	folio_set_referenced(folio);
 	return nr_pages;
 }
@@ -3331,7 +3545,7 @@ static unsigned long gup_fast_pud_leaf(pud_t orig, pud_t *pudp,
 		return 0;
 	}
 
-	if (!gup_fast_folio_allowed(folio, flags)) {
+	if (!gup_fast_folio_allowed(folio, flags, out->frs)) {
 		gup_put_folio(folio, nr_pages, flags);
 		return 0;
 	}
@@ -3342,7 +3556,11 @@ static unsigned long gup_fast_pud_leaf(pud_t orig, pud_t *pudp,
 		return 0;
 	}
 
-	gup_out_add_range(out, folio, page, nr_pages);
+	if (!gup_out_add_range(out, folio, page, nr_pages)) {
+		gup_put_folio(folio, nr_pages, flags);
+		return 0;
+	}
+
 	folio_set_referenced(folio);
 	return nr_pages;
 }
@@ -3486,8 +3704,25 @@ static bool gup_fast_permitted(unsigned long start, unsigned long end)
  */
 static void gup_fast_unpin(struct gup_out *out)
 {
-	gup_fast_unpin_user_pages(out->pages, out->nr_pages);
+	if (out->frs) {
+		unsigned int i;
+
+		for (i = 0; i < out->nr_frs; i++)
+			gup_put_folio(out->frs[i].folio, out->frs[i].nr_pages,
+				      FOLL_PIN);
+		out->nr_frs = 0;
+	} else {
+		gup_fast_unpin_user_pages(out->pages, out->nr_pages);
+	}
 	out->nr_pages = 0;
+}
+
+static void gup_fast_sanity_check(struct gup_out *out)
+{
+	if (out->frs)
+		sanity_check_pinned_folio_ranges(out->frs, out->nr_frs);
+	else
+		sanity_check_pinned_pages(out->pages, out->nr_pages);
 }
 
 static unsigned long gup_fast(unsigned long start, unsigned long end,
@@ -3531,7 +3766,7 @@ static unsigned long gup_fast(unsigned long start, unsigned long end,
 			gup_fast_unpin(out);
 			return 0;
 		} else {
-			sanity_check_pinned_pages(out->pages, out->nr_pages);
+			gup_fast_sanity_check(out);
 		}
 	}
 	return out->nr_pages;
@@ -3566,6 +3801,10 @@ static long gup_fast_fallback_out(unsigned long start, unsigned long nr_pages,
 
 	nr_pinned = gup_fast(start, end, gup_flags, out);
 	if (nr_pinned == nr_pages || gup_flags & FOLL_FAST_ONLY)
+		return nr_pinned;
+
+	/* No room left to report anything the slow path could get us. */
+	if (gup_out_is_full(out))
 		return nr_pinned;
 
 	/* Slow path: try to get the remaining pages with get_user_pages */
@@ -3687,6 +3926,79 @@ int pin_user_pages_fast(unsigned long start, int nr_pages,
 	return gup_fast_fallback(start, nr_pages, gup_flags, pages);
 }
 EXPORT_SYMBOL_GPL(pin_user_pages_fast);
+
+/**
+ * pin_user_folio_ranges_fast() - pin user pages in memory without taking
+ *                                locks, reporting them as folio ranges
+ *
+ * @start:      starting user address
+ * @nr_pages:   number of pages from start to pin
+ * @gup_flags:  flags modifying pin behaviour
+ * @frs:        array that receives the pinned folio ranges
+ * @max_frs:    number of entries in the @frs array
+ * @nr_frs:     receives the number of folio ranges filled into @frs
+ *
+ * Like pin_user_pages_fast(), but instead of reporting each page separately,
+ * consecutive pages of the same folio are reported as a single folio range.
+ * A range never spans more than one folio, so a caller that has to fall back
+ * to per-page processing can always do so via folio_range_page().
+ *
+ * Pinning stops early once @max_frs ranges have been filled, so that the
+ * number of pages pinned can be smaller than @nr_pages even though more pages
+ * are present. Callers that cannot deal with short pins should size @frs to
+ * hold @nr_pages ranges, which is the worst case.
+ *
+ * FOLL_LONGTERM is not supported yet.
+ *
+ * The pins have to be released with unpin_user_folio_ranges(), or per range
+ * with unpin_user_folio(fr->folio, fr->nr_pages).
+ *
+ * Note that if the zero page is amongst the returned ranges, it will not have
+ * pins in it and unpinning will not remove pins from it.
+ *
+ * Memory that is not necessarily backed by folios, such as pages a driver
+ * inserted into a VM_MIXEDMAP vma, cannot be reported as folio ranges: pinning
+ * stops in front of it and -EOPNOTSUPP is returned if it comes first.  Callers
+ * have to fall back to pin_user_pages_fast() for it.
+ *
+ * Return: number of pages pinned, which can be less than @nr_pages. If no
+ * pages were pinned, a negative errno is returned. @nr_frs is only valid if
+ * the return value is positive.
+ */
+long pin_user_folio_ranges_fast(unsigned long start, unsigned long nr_pages,
+				unsigned int gup_flags, struct folio_range *frs,
+				unsigned int max_frs, unsigned int *nr_frs)
+{
+	struct gup_out out = {
+		.frs = frs,
+		.max_frs = max_frs,
+	};
+	long ret;
+
+	if (WARN_ON_ONCE(!frs || !max_frs))
+		return -EINVAL;
+
+	/*
+	 * Migrating away from unpinnable memory in the FOLL_LONGTERM case
+	 * still requires an array of pages or folios; until that is sorted
+	 * out, don't pretend we can handle it.
+	 */
+	if (WARN_ON_ONCE(gup_flags & FOLL_LONGTERM))
+		return -EINVAL;
+
+	if (!nr_pages){
+		*nr_frs = 0;
+		return 0;
+	}
+
+	if (!__is_valid_gup_args(true, NULL, &gup_flags, FOLL_PIN))
+		return -EINVAL;
+
+	ret = gup_fast_fallback_out(start, nr_pages, gup_flags, &out);
+	*nr_frs = out.nr_frs;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pin_user_folio_ranges_fast);
 
 /**
  * pin_user_pages_remote() - pin pages of a remote process
