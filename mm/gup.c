@@ -725,36 +725,40 @@ unsigned long gup_unshared_pages(struct vm_area_struct *vma, unsigned int flags,
 	return nr_pages;
 }
 
+/* Record @nr pages starting at @page in @out, and flush their caches. */
 static void gup_fill_pages(struct vm_area_struct *vma, unsigned long address,
-		struct page *page, unsigned long nr, struct page **pages)
+		struct page *page, unsigned long nr, struct gup_out *out)
 {
 	unsigned long i;
 
-	if (!pages)
+	if (!out)
 		return;
+
+	gup_out_add_range(out, page_folio(page), page, nr);
 
 	for (i = 0; i < nr; i++) {
 		struct page *subpage = page + i;
 
-		pages[i] = subpage;
 		flush_anon_page(vma, subpage, address + i * PAGE_SIZE);
 		flush_dcache_page(subpage);
 	}
 }
 
 /*
- * Flush the caches for @nr pages stored in @pages. The caller already
- * holds folio references, so the pages cannot go away; this runs
- * without any page table lock held.
+ * Flush the caches for the @nr pages most recently recorded in @out, the first
+ * of which is mapped at @address. The caller already holds folio references,
+ * so the pages cannot go away; this runs without any page table lock held.
  */
 static void gup_flush_pages(struct vm_area_struct *vma, unsigned long address,
-		struct page **pages, unsigned long nr)
+		struct gup_out *out, unsigned long nr)
 {
+	struct page **pages;
 	unsigned long i;
 
-	if (!pages)
+	if (!out)
 		return;
 
+	pages = out->pages + out->nr_pages - nr;
 	for (i = 0; i < nr; i++) {
 		flush_anon_page(vma, pages[i], address + i * PAGE_SIZE);
 		flush_dcache_page(pages[i]);
@@ -945,9 +949,8 @@ static inline bool can_follow_write_pte(pte_t pte, struct page *page,
  */
 static long gup_grab_folio_pages(struct folio *folio,
 		struct page *page, unsigned long nr, bool dirty,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
-	unsigned long i;
 	long ret;
 
 	/* try_grab_folio() does nothing unless FOLL_GET or FOLL_PIN is set. */
@@ -978,10 +981,8 @@ static long gup_grab_folio_pages(struct folio *folio,
 		folio_mark_accessed(folio);
 	}
 
-	if (pages) {
-		for (i = 0; i < nr; i++)
-			pages[i] = page + i;
-	}
+	if (out)
+		gup_out_add_range(out, folio, page, nr);
 
 	return 0;
 }
@@ -1073,7 +1074,7 @@ static unsigned long gup_pte_batch_len(struct vm_area_struct *vma,
  */
 static long follow_page_pte(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, pmd_t *pmd,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	bool need_no_page_table = false;
@@ -1116,8 +1117,7 @@ static long follow_page_pte(struct vm_area_struct *vma,
 		batch = gup_pte_batch_len(vma, address, walk_end, folio,
 					 ptep, &batch_pte, flags);
 		ret = gup_grab_folio_pages(folio, page, batch,
-						     pte_dirty(batch_pte), flags,
-						     pages ? pages + nr : NULL);
+						     pte_dirty(batch_pte), flags, out);
 		if (ret)
 			break;
 		nr += batch;
@@ -1131,7 +1131,7 @@ static long follow_page_pte(struct vm_area_struct *vma,
 	pte_unmap_unlock(orig_ptep, ptl);
 
 	if (nr) {
-		gup_flush_pages(vma, base, pages, nr);
+		gup_flush_pages(vma, base, out, nr);
 		return nr;
 	}
 	if (need_no_page_table)
@@ -1141,9 +1141,10 @@ static long follow_page_pte(struct vm_area_struct *vma,
 
 static long follow_pmd_mask(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, pud_t *pudp,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	pmd_t *pmd, pmdval;
+	struct page *page;
 	spinlock_t *ptl;
 	long ret;
 	struct mm_struct *mm = vma->vm_mm;
@@ -1155,7 +1156,7 @@ static long follow_pmd_mask(struct vm_area_struct *vma,
 	if (!pmd_present(pmdval))
 		return no_page_table(vma, flags, address);
 	if (likely(!pmd_leaf(pmdval)))
-		return follow_page_pte(vma, address, end, pmd, flags, pages);
+		return follow_page_pte(vma, address, end, pmd, flags, out);
 
 	if (pmd_protnone(pmdval) && !gup_can_follow_protnone(vma, flags))
 		return no_page_table(vma, flags, address);
@@ -1168,33 +1169,34 @@ static long follow_pmd_mask(struct vm_area_struct *vma,
 	}
 	if (unlikely(!pmd_leaf(pmdval))) {
 		spin_unlock(ptl);
-		return follow_page_pte(vma, address, end, pmd, flags, pages);
+		return follow_page_pte(vma, address, end, pmd, flags, out);
 	}
 	if (pmd_trans_huge(pmdval) && (flags & FOLL_SPLIT_PMD)) {
 		spin_unlock(ptl);
 		split_huge_pmd(vma, pmd, address);
 		/* If pmd was left empty, stuff a page table in there quickly */
 		return pte_alloc(mm, pmd) ? -ENOMEM :
-			follow_page_pte(vma, address, end, pmd, flags, pages);
+			follow_page_pte(vma, address, end, pmd, flags, out);
 	}
-	ret = follow_huge_pmd(vma, address, end, pmd, flags, pages);
+	ret = follow_huge_pmd(vma, address, end, pmd, flags, &page);
 	spin_unlock(ptl);
 
 	/*
-	 * The ref is already held, so the page cannot go away: fill the
-	 * array and flush caches without the pmd lock.
+	 * The ref is already held, so the page cannot go away: record the
+	 * pages and flush caches without the pmd lock.
 	 */
-	if (ret > 0 && pages)
-		gup_fill_pages(vma, address, pages[0], ret, pages);
+	if (ret > 0)
+		gup_fill_pages(vma, address, page, ret, out);
 
 	return ret;
 }
 
 static long follow_pud_mask(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, p4d_t *p4dp,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	pud_t *pudp, pud;
+	struct page *page;
 	spinlock_t *ptl;
 	long ret;
 	struct mm_struct *mm = vma->vm_mm;
@@ -1205,16 +1207,16 @@ static long follow_pud_mask(struct vm_area_struct *vma,
 		return no_page_table(vma, flags, address);
 	if (pud_leaf(pud)) {
 		ptl = pud_lock(mm, pudp);
-		ret = follow_huge_pud(vma, address, end, pudp, flags, pages);
+		ret = follow_huge_pud(vma, address, end, pudp, flags, &page);
 		spin_unlock(ptl);
 		/*
-		 * The ref is already held, so the page cannot go away: fill
-		 * the array and flush caches without the lock. A 1 GB folio
+		 * The ref is already held, so the page cannot go away: record
+		 * the pages and flush caches without the lock. A 1 GB folio
 		 * can be up to HPAGE_PUD_NR pages, too long to flush under a
 		 * spinlock.
 		 */
-		if (ret > 0 && pages)
-			gup_fill_pages(vma, address, pages[0], ret, pages);
+		if (ret > 0)
+			gup_fill_pages(vma, address, page, ret, out);
 		if (ret)
 			return ret;
 		return no_page_table(vma, flags, address);
@@ -1222,12 +1224,12 @@ static long follow_pud_mask(struct vm_area_struct *vma,
 	if (unlikely(pud_bad(pud)))
 		return no_page_table(vma, flags, address);
 
-	return follow_pmd_mask(vma, address, end, pudp, flags, pages);
+	return follow_pmd_mask(vma, address, end, pudp, flags, out);
 }
 
 static long follow_p4d_mask(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, pgd_t *pgdp,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	p4d_t *p4dp, p4d;
 
@@ -1238,7 +1240,7 @@ static long follow_p4d_mask(struct vm_area_struct *vma,
 	if (!p4d_present(p4d) || p4d_bad(p4d))
 		return no_page_table(vma, flags, address);
 
-	return follow_pud_mask(vma, address, end, p4dp, flags, pages);
+	return follow_pud_mask(vma, address, end, p4dp, flags, out);
 }
 
 /**
@@ -1247,9 +1249,9 @@ static long follow_p4d_mask(struct vm_area_struct *vma,
  * @address: virtual address to look up
  * @end: virtual address at which to stop batching contiguous pages
  * @flags: flags modifying lookup behaviour
- * @pages: array to receive the pages, refcounted per @flags, or NULL to
- *         walk the page tables (e.g. to fault pages in) without collecting
- *         or refcounting them
+ * @out: output descriptor to receive the pages, refcounted per @flags, or
+ *       NULL to walk the page tables (e.g. to fault pages in) without
+ *       collecting or refcounting them
  *
  * @flags can have FOLL_ flags set, defined in <linux/mm.h>
  *
@@ -1259,14 +1261,14 @@ static long follow_p4d_mask(struct vm_area_struct *vma,
  * relevant with FOLL_PIN and !FOLL_WRITE.
  *
  * Return: the number of contiguous pages starting at @address that were
- * placed into @pages (if non-NULL), which may be fewer than the pages
+ * recorded in @out (if non-NULL), which may be fewer than the pages
  * requested via @end; 0 if no mapping exists at @address; or a negative
  * errno for a mapping to something not represented by a page descriptor
  * (see also vm_normal_page()).
  */
 static long follow_page_mask(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end,
-		unsigned int flags, struct page **pages)
+		unsigned int flags, struct gup_out *out)
 {
 	pgd_t *pgd;
 	struct mm_struct *mm = vma->vm_mm;
@@ -1279,7 +1281,7 @@ static long follow_page_mask(struct vm_area_struct *vma,
 	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
 		ret = no_page_table(vma, flags, address);
 	else
-		ret = follow_p4d_mask(vma, address, end, pgd, flags, pages);
+		ret = follow_p4d_mask(vma, address, end, pgd, flags, out);
 
 	vma_pgtable_walk_end(vma);
 
@@ -1562,9 +1564,8 @@ static struct vm_area_struct *gup_vma_lookup(struct mm_struct *mm,
  * @start:	starting user address
  * @nr_pages:	number of pages from start to pin
  * @gup_flags:	flags modifying pin behaviour
- * @pages:	array that receives pointers to the pages pinned.
- *		Should be at least nr_pages long. Or NULL, if caller
- *		only intends to ensure the pages are faulted in.
+ * @out:	output descriptor receiving the pinned pages, or NULL if the
+ *		caller only intends to ensure the pages are faulted in.
  * @locked:     whether we're still with the mmap_lock held
  *
  * Returns either number of pages pinned (which may be less than the
@@ -1612,7 +1613,7 @@ static struct vm_area_struct *gup_vma_lookup(struct mm_struct *mm,
  */
 static long __get_user_pages(struct mm_struct *mm,
 		unsigned long start, unsigned long nr_pages,
-		unsigned int gup_flags, struct page **pages,
+		unsigned int gup_flags, struct gup_out *out,
 		int *locked)
 {
 	long ret = 0, i = 0;
@@ -1623,7 +1624,7 @@ static long __get_user_pages(struct mm_struct *mm,
 
 	start = untagged_addr_remote(mm, start);
 
-	VM_WARN_ON_ONCE(!!pages != !!(gup_flags & (FOLL_GET | FOLL_PIN)));
+	VM_WARN_ON_ONCE(!!out != !!(gup_flags & (FOLL_GET | FOLL_PIN)));
 
 	/* FOLL_GET and FOLL_PIN are mutually exclusive. */
 	VM_WARN_ON_ONCE((gup_flags & (FOLL_PIN | FOLL_GET)) ==
@@ -1655,11 +1656,10 @@ static long __get_user_pages(struct mm_struct *mm,
 			if (!vma && in_gate_area(mm, start)) {
 				ret = get_gate_page(mm, start & PAGE_MASK,
 						gup_flags, &vma,
-						pages ? &page : NULL);
+						out ? &page : NULL);
 				if (ret)
 					goto out;
-				gup_fill_pages(vma, start, page, 1,
-					       pages ? pages + i : NULL);
+				gup_fill_pages(vma, start, page, 1, out);
 				i++;
 				start += PAGE_SIZE;
 				nr_pages--;
@@ -1686,7 +1686,7 @@ retry:
 		cond_resched();
 
 		nr = follow_page_mask(vma, start, start + nr_pages * PAGE_SIZE,
-				      gup_flags, pages ? &pages[i] : NULL);
+				      gup_flags, out);
 		if (!nr || nr == -EMLINK) {
 			ret = faultin_page(vma, start, gup_flags,
 					   nr == -EMLINK, locked);
@@ -1706,12 +1706,12 @@ retry:
 		} else if (nr == -EEXIST) {
 			/*
 			 * Proper page table entry exists, but no corresponding
-			 * struct page. If the caller expects **pages to be
-			 * filled in, bail out now, because that can't be done
+			 * struct page. If the caller expects the pages to be
+			 * reported, bail out now, because that can't be done
 			 * for this page. Otherwise advance by the one page
 			 * follow_page_mask() looked at.
 			 */
-			if (pages) {
+			if (out) {
 				ret = nr;
 				goto out;
 			}
@@ -1869,10 +1869,10 @@ static bool gup_signal_pending(unsigned int flags)
  * Please note that this function, unlike __get_user_pages(), will not return 0
  * for nr_pages > 0, unless FOLL_NOWAIT is used.
  */
-static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
+static __always_inline long __get_user_pages_locked_out(struct mm_struct *mm,
 						unsigned long start,
 						unsigned long nr_pages,
-						struct page **pages,
+						struct gup_out *out,
 						int *locked,
 						unsigned int flags)
 {
@@ -1907,12 +1907,12 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
 	 * FOLL_PIN always expects pages to be non-null, but no need to assert
 	 * that here, as any failures will be obvious enough.
 	 */
-	if (pages && !(flags & FOLL_PIN))
+	if (out && !(flags & FOLL_PIN))
 		flags |= FOLL_GET;
 
 	pages_done = 0;
 	for (;;) {
-		ret = __get_user_pages(mm, start, nr_pages, flags, pages,
+		ret = __get_user_pages(mm, start, nr_pages, flags, out,
 				       locked);
 		if (!(flags & FOLL_UNLOCKABLE)) {
 			/* VM_FAULT_RETRY couldn't trigger, bypass */
@@ -1938,12 +1938,7 @@ static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
 				pages_done = ret;
 			break;
 		}
-		/*
-		 * VM_FAULT_RETRY triggered, so seek to the faulting offset.
-		 * For the prefault case (!pages) we only update counts.
-		 */
-		if (likely(pages))
-			pages += ret;
+		/* VM_FAULT_RETRY triggered, so seek to the faulting offset. */
 		start += ret << PAGE_SHIFT;
 
 		/* The lock was temporarily dropped, so we must unlock later */
@@ -1973,7 +1968,7 @@ retry:
 
 		*locked = 1;
 		ret = __get_user_pages(mm, start, 1, flags | FOLL_TRIED,
-				       pages, locked);
+				       out, locked);
 		if (!*locked) {
 			/* Continue to retry until we succeeded */
 			VM_WARN_ON_ONCE(ret != 0);
@@ -1989,8 +1984,6 @@ retry:
 		pages_done++;
 		if (!nr_pages)
 			break;
-		if (likely(pages))
-			pages++;
 		start += PAGE_SIZE;
 	}
 	if (must_unlock && *locked) {
@@ -2011,6 +2004,19 @@ retry:
 		return -EFAULT;
 
 	return pages_done;
+}
+
+static __always_inline long __get_user_pages_locked(struct mm_struct *mm,
+						unsigned long start,
+						unsigned long nr_pages,
+						struct page **pages,
+						int *locked,
+						unsigned int flags)
+{
+	struct gup_out out = GUP_OUT_PAGES(pages);
+
+	return __get_user_pages_locked_out(mm, start, nr_pages,
+					   pages ? &out : NULL, locked, flags);
 }
 
 /**
@@ -2203,8 +2209,8 @@ int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
 	return ret;	/* 0 or negative error code */
 }
 #else /* CONFIG_MMU */
-static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
-		unsigned long nr_pages, struct page **pages,
+static long __get_user_pages_locked_out(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, struct gup_out *out,
 		int *locked, unsigned int foll_flags)
 {
 	struct vm_area_struct *vma;
@@ -2228,7 +2234,7 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
 	}
 
 	/* See the MMU variant: support the traditional behavior. */
-	if (pages && !(foll_flags & FOLL_PIN))
+	if (out && !(foll_flags & FOLL_PIN))
 		foll_flags |= FOLL_GET;
 
 	/* calculate required read or write permissions.
@@ -2249,16 +2255,19 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
 		    !(vm_flags & vma->vm_flags))
 			break;
 
-		if (pages) {
-			pages[i] = virt_to_page((void *)start);
-			if (!pages[i])
+		if (out) {
+			struct page *page = virt_to_page((void *)start);
+			struct folio *folio;
+
+			if (!page)
 				break;
-			ret = try_grab_folio(page_folio(pages[i]), 1, foll_flags);
+			folio = page_folio(page);
+			ret = try_grab_folio(folio, 1, foll_flags);
 			if (unlikely(ret)) {
-				pages[i] = NULL;
 				err = ret;
 				break;
 			}
+			gup_out_add_range(out, folio, page, 1);
 		}
 
 		start = (start + PAGE_SIZE) & PAGE_MASK;
@@ -2270,6 +2279,17 @@ static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
 	}
 
 	return i ? : err;
+}
+
+static long __get_user_pages_locked(struct mm_struct *mm, unsigned long start,
+		unsigned long nr_pages, struct page **pages,
+		int *locked, unsigned int foll_flags)
+{
+	struct gup_out out = GUP_OUT_PAGES(pages);
+
+	return __get_user_pages_locked_out(mm, start, nr_pages,
+					   pages ? &out : NULL, locked,
+					   foll_flags);
 }
 #endif /* !CONFIG_MMU */
 
@@ -2695,6 +2715,51 @@ static long check_and_migrate_movable_folios(unsigned long nr_folios,
  * __gup_longterm_locked() is a wrapper for __get_user_pages_locked which
  * allows us to process the FOLL_LONGTERM flag.
  */
+static long __gup_longterm_locked_out(struct mm_struct *mm,
+				  unsigned long start,
+				  unsigned long nr_pages,
+				  struct gup_out *out,
+				  int *locked,
+				  unsigned int gup_flags)
+{
+	unsigned long nr_pages_done;
+	unsigned int flags;
+	long rc, nr_pinned_pages;
+
+	if (!(gup_flags & FOLL_LONGTERM))
+		return __get_user_pages_locked_out(mm, start, nr_pages, out,
+						   locked, gup_flags);
+
+	if (WARN_ON_ONCE(!out))
+		return -EINVAL;
+
+	/*
+	 * We might have to start over, in which case everything recorded by
+	 * this call has to be discarded again.
+	 */
+	nr_pages_done = out->nr_pages;
+
+	flags = memalloc_pin_save();
+	do {
+		out->nr_pages = nr_pages_done;
+
+		nr_pinned_pages = __get_user_pages_locked_out(mm, start,
+							      nr_pages, out,
+							      locked,
+							      gup_flags);
+		if (nr_pinned_pages <= 0) {
+			rc = nr_pinned_pages;
+			break;
+		}
+
+		/* FOLL_LONGTERM implies FOLL_PIN */
+		rc = check_and_migrate_movable_pages(nr_pinned_pages,
+						     out->pages + nr_pages_done);
+	} while (rc == -EAGAIN);
+	memalloc_pin_restore(flags);
+	return rc ? rc : nr_pinned_pages;
+}
+
 static long __gup_longterm_locked(struct mm_struct *mm,
 				  unsigned long start,
 				  unsigned long nr_pages,
@@ -2702,28 +2767,11 @@ static long __gup_longterm_locked(struct mm_struct *mm,
 				  int *locked,
 				  unsigned int gup_flags)
 {
-	unsigned int flags;
-	long rc, nr_pinned_pages;
+	struct gup_out out = GUP_OUT_PAGES(pages);
 
-	if (!(gup_flags & FOLL_LONGTERM))
-		return __get_user_pages_locked(mm, start, nr_pages, pages,
-					       locked, gup_flags);
-
-	flags = memalloc_pin_save();
-	do {
-		nr_pinned_pages = __get_user_pages_locked(mm, start, nr_pages,
-							  pages, locked,
-							  gup_flags);
-		if (nr_pinned_pages <= 0) {
-			rc = nr_pinned_pages;
-			break;
-		}
-
-		/* FOLL_LONGTERM implies FOLL_PIN */
-		rc = check_and_migrate_movable_pages(nr_pinned_pages, pages);
-	} while (rc == -EAGAIN);
-	memalloc_pin_restore(flags);
-	return rc ? rc : nr_pinned_pages;
+	return __gup_longterm_locked_out(mm, start, nr_pages,
+					 pages ? &out : NULL, locked,
+					 gup_flags);
 }
 
 /*
