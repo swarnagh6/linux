@@ -482,6 +482,45 @@ static inline void mm_set_has_pinned_flag(struct mm_struct *mm)
 		mm_flags_set(MMF_HAS_PINNED, mm);
 }
 
+/*
+ * Output descriptor of the GUP page table walkers.
+ *
+ * GUP hands the memory it grabbed back to the caller as an array of pages
+ * (@pages).
+ *
+ * @nr_pages is the number of pages recorded so far: the walkers simply keep
+ * appending to the descriptor, no matter how often they are called for a
+ * single GUP request.
+ */
+struct gup_out {
+	struct page **pages;
+	unsigned long nr_pages;
+};
+
+#define GUP_OUT_PAGES(_pages)		((struct gup_out){ .pages = (_pages) })
+
+/**
+ * gup_out_add_range() - record consecutive pages of a single folio
+ * @out: the output descriptor
+ * @folio: the folio @page belongs to
+ * @page: the first page to record
+ * @nr_pages: the number of consecutive pages to record
+ *
+ * The caller must hold a reference (FOLL_GET) or pin (FOLL_PIN) for each of
+ * the @nr_pages pages.
+ */
+static inline void gup_out_add_range(struct gup_out *out, struct folio *folio,
+			      struct page *page, unsigned long nr_pages)
+{
+	struct page **pages = out->pages + out->nr_pages;
+	unsigned long i;
+
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = page + i;
+
+	out->nr_pages += nr_pages;
+}
+
 #ifdef CONFIG_MMU
 
 #ifdef CONFIG_HAVE_GUP_FAST
