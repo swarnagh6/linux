@@ -1109,6 +1109,12 @@ static long gup_grab_folio_pages(struct folio *folio,
 			return ret;
 		}
 	}
+
+	if (out && !gup_out_add_range(out, folio, page, nr)) {
+		gup_put_folio(folio, nr, flags);
+		return -ENOSPC;
+	}
+
 	if (flags & FOLL_TOUCH) {
 		if ((flags & FOLL_WRITE) && !dirty && !folio_test_dirty(folio))
 			folio_mark_dirty(folio);
@@ -1118,11 +1124,6 @@ static long gup_grab_folio_pages(struct folio *folio,
 		 * folio_mark_accessed().
 		 */
 		folio_mark_accessed(folio);
-	}
-
-	if (out && !gup_out_add_range(out, folio, page, nr)) {
-		gup_put_folio(folio, nr, flags);
-		return -ENOSPC;
 	}
 
 	return 0;
@@ -1829,7 +1830,7 @@ static long __get_user_pages(struct mm_struct *mm,
 			if (ret)
 				goto out;
 			if (out && out->frs && (vma->vm_flags & VM_MIXEDMAP)) {
-				ret = -EOPNOTSUPP;
+				ret = i ? 0 : -EOPNOTSUPP;
 				goto out;
 			}
 		}
@@ -3200,13 +3201,14 @@ EXPORT_SYMBOL(get_user_pages_unlocked);
  * fall back to the slow path.
  */
 /*
- * @need_folio is set when the caller reports the memory as folio ranges, which
- * describe memory by its folio.  A page without any mapping might not be a
+ * @folio_ranges is set when the caller requests folio-range output. The NULL
+ * mapping check is conservative and defers to slow path which gets checked
+ * against the VMA information. A page without any mapping might not be a
  * folio at all (e.g. a bare page a driver installed via vm_insert_page()), so
  * such pages are left to the slow path, which can consult the vma.
  */
 static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags,
-				   bool need_folio)
+				   bool folio_ranges)
 {
 	bool reject_file_backed = false;
 	struct address_space *mapping;
@@ -3227,7 +3229,7 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags,
 	if (IS_ENABLED(CONFIG_SECRETMEM) && !folio_test_large(folio))
 		check_secretmem = true;
 
-	if (!reject_file_backed && !check_secretmem && !need_folio)
+	if (!reject_file_backed && !check_secretmem && !folio_ranges)
 		return true;
 
 	if (WARN_ON_ONCE(folio_test_slab(folio)))
@@ -3265,7 +3267,7 @@ static bool gup_fast_folio_allowed(struct folio *folio, unsigned int flags,
 	 * fast path, unless the caller needs it to be a folio.
 	 */
 	if (!mapping)
-		return !reject_file_backed && !need_folio;
+		return !reject_file_backed && !folio_ranges;
 
 	/* Anonymous folios pose no problem. */
 	mapping_flags = (unsigned long)mapping & FOLIO_MAPPING_FLAGS;
